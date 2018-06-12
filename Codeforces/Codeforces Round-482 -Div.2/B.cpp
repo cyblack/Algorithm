@@ -16,20 +16,17 @@ int main(int argc, const char * argv[]) {
             if(str[i+p]=='.'){
                 str[i]='0';
                 str[i+p]='1';
-                ok = false;
-                break;
             }else if(str[i+p]=='0'){
                 str[i]='1';
-                ok = false;
-                break;
             }else if(str[i+p]=='1'){
                 str[i]='0';
-                ok= false;
-                break;
             }
+            
         }else if(str[i+p]=='.'){
             if(str[i]=='0') str[i+p]='1';
             else if(str[i]=='1') str[i+p]='0';
+            ok=false;
+            break;
         }else if(str[i]!=str[i+p]){
             ok=false;
             break;
