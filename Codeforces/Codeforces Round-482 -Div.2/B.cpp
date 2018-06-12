@@ -4,7 +4,6 @@ char str[2001];
 char ans[2001];
 int main(int argc, const char * argv[]) {
     
-    
     int n,p;
     
     scanf("%d %d",&n,&p);
@@ -21,7 +20,8 @@ int main(int argc, const char * argv[]) {
             }else if(str[i+p]=='1'){
                 str[i]='0';
             }
-            
+            ok= false;
+            break;
         }else if(str[i+p]=='.'){
             if(str[i]=='0') str[i+p]='1';
             else if(str[i]=='1') str[i+p]='0';
@@ -41,7 +41,6 @@ int main(int argc, const char * argv[]) {
     
     return 0;
 }
-
 
 /*
  
