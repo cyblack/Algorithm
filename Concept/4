@@ -1,0 +1,145 @@
+import random
+from collections import defaultdict
+from typing import List, Tuple, Dict
+
+Point = Tuple[int, int]
+BBox  = Tuple[int, int, int, int]
+W = 1024
+H = 1024
+
+# ---------- score utils ----------
+def bbox_of(pts: List[Point]) -> BBox:
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+def area(b: BBox) -> int:
+    x1,y1,x2,y2 = b
+    return (x2-x1+1) * (y2-y1+1)
+
+def sum_sq(HH: int) -> int:
+    return (HH - 1) * HH * (2*HH - 1) // 6
+
+def score_from_bboxes(bboxes: List[BBox]) -> float:
+    HH = len(bboxes)
+    if HH == 0:
+        return float("-inf")
+    add = sum_sq(HH)
+    areas = [area(b) for b in bboxes]
+    mu = sum(areas) / HH
+    pen = sum(abs(a - mu) / 10.0 for a in areas)
+    return add - pen
+
+# ---------- overlap check ----------
+def bbox_overlap(b1: BBox, b2: BBox, include_boundary: bool = True) -> bool:
+    x1, y1, x2, y2 = b1
+    a1, b1y, a2, b2y = b2
+    if include_boundary:
+        if x2 < a1 or a2 < x1: return False
+        if y2 < b1y or b2y < y1: return False
+        return True
+    else:
+        if x2 <= a1 or a2 <= x1: return False
+        if y2 <= b1y or b2y <= y1: return False
+        return True
+
+def check_overlaps(bboxes: List[BBox], include_boundary: bool = True, max_print: int = 10):
+    pairs = []
+    for i in range(len(bboxes)):
+        for j in range(i+1, len(bboxes)):
+            if bbox_overlap(bboxes[i], bboxes[j], include_boundary=include_boundary):
+                pairs.append((i, j))
+                if len(pairs) <= max_print:
+                    print(f"[OVERLAP] {i} {bboxes[i]} <-> {j} {bboxes[j]}")
+    print(f"Overlap pairs: {len(pairs)} (include_boundary={include_boundary})")
+    return pairs
+
+# ---------- multilevel tile packing (NO OVERLAP by construction) ----------
+def multilevel_tile_pack(points: List[Point], base_S: int, ox: int, oy: int, seed: int = 0):
+    """
+    - base_S 타일로 시작, <4인 타일은 다음 레벨(2S)로 승격
+    - 같은 타일 안에서만 그룹 생성(자투리도 같은 타일의 마지막 그룹에 흡수)
+    - 승격된 타일에서는 하우스를 짓지 않으므로, 레벨 간 겹침이 구조적으로 발생 불가
+    """
+    rng = random.Random(seed)
+    carry = points[:]          # 아직 처리 못한 점들
+    size = base_S
+    groups: List[List[Point]] = []
+
+    while carry:
+        tiles: Dict[Tuple[int, int], List[Point]] = defaultdict(list)
+        for x, y in carry:
+            tx = (x + ox) // size
+            ty = (y + oy) // size
+            tiles[(tx, ty)].append((x, y))
+
+        next_carry: List[Point] = []
+        for tid, pts in tiles.items():
+            m = len(pts)
+            if m < 4:
+                next_carry.extend(pts)  # 다음 레벨로 승격
+                continue
+
+            rng.shuffle(pts)
+            q = (m // 4) * 4
+            # 4개씩 그룹
+            for i in range(0, q, 4):
+                groups.append(pts[i:i+4])
+            # 자투리(1~3)는 같은 타일의 마지막 그룹에 흡수 (겹침 위험 없음: 타일 내부)
+            rem = pts[q:]
+            if rem:
+                groups[-1].extend(rem)
+
+        carry = next_carry
+        if not carry:
+            break
+        if size >= 1024:
+            # 이 상황이면 carry가 4 미만이어야 하는데,
+            # 위에서 <4는 계속 승격하므로 최종적으로는 한 타일에 모여 >=4가 되는 게 정상.
+            # 안전장치(이론상 거의 안 탐)
+            groups.append(carry)
+            carry = []
+            break
+        size *= 2
+
+    bboxes = [bbox_of(g) for g in groups]
+    sc = score_from_bboxes(bboxes)
+    return bboxes, sc, groups
+
+# ---------- sweep S + offsets (single fixed seed) ----------
+def solve_sweep(points: List[Point], S_candidates=(24, 28, 32, 36, 40, 48), use_offsets=True, seed=0):
+    best = None  # (score, bboxes, meta)
+    for S in S_candidates:
+        offsets = [(0, 0)]
+        if use_offsets:
+            h = S // 2
+            offsets = [(0,0), (h,0), (0,h), (h,h)]
+        for ox, oy in offsets:
+            bboxes, sc, groups = multilevel_tile_pack(points, base_S=S, ox=ox, oy=oy, seed=seed)
+            meta = {"S": S, "ox": ox, "oy": oy, "houses": len(bboxes)}
+            if best is None or sc > best[0]:
+                best = (sc, bboxes, groups, meta)
+    return best
+
+# ---------- demo ----------
+def generate_random_points(n: int, seed: int = 42) -> List[Point]:
+    rng = random.Random(seed)
+    idxs = rng.sample(range(W*H), n)
+    return [(i % W, i // W) for i in idxs]
+
+if __name__ == "__main__":
+    pts = generate_random_points(2000, seed=42)
+
+    best_score, best_bboxes, best_groups, meta = solve_sweep(
+        pts,
+        S_candidates=(24, 28, 32, 36, 40, 48),
+        use_offsets=True,
+        seed=0
+    )
+
+    print("BEST score:", best_score)
+    print("Meta:", meta)
+    print("Last group size:", len(best_groups[-1]))
+
+    # 겹침 체크 (여기서 0이 나와야 정상)
+    check_overlaps(best_bboxes, include_boundary=True, max_print=5)
