@@ -1,0 +1,303 @@
+import random
+from typing import List, Tuple, Dict, Optional
+
+Point = Tuple[int, int]
+BBox  = Tuple[int, int, int, int]  # (xmin, ymin, xmax, ymax)
+
+W = 1024
+H = 1024
+
+# ----------------- bbox / score -----------------
+def bbox_of(pts: List[Point]) -> BBox:
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+def area(b: BBox) -> int:
+    x1,y1,x2,y2 = b
+    return (x2-x1+1) * (y2-y1+1)
+
+def sum_sq(HH: int) -> int:
+    return (HH - 1) * HH * (2*HH - 1) // 6
+
+def score_from_bboxes(bboxes: List[BBox]) -> float:
+    HH = len(bboxes)
+    if HH == 0:
+        return float("-inf")
+    add = sum_sq(HH)
+    areas = [area(b) for b in bboxes]
+    mu = sum(areas) / HH
+    pen = sum(abs(a - mu) / 10.0 for a in areas)
+    return add - pen
+
+# ----------------- STRICT overlap (boundary touch counts as overlap) -----------------
+def bbox_overlap_strict(b1: BBox, b2: BBox) -> bool:
+    x1, y1, x2, y2 = b1
+    a1, b1y, a2, b2y = b2
+    # If NOT strictly separated, treat as overlap (boundary-touch included)
+    if x2 < a1 or a2 < x1:
+        return False
+    if y2 < b1y or b2y < y1:
+        return False
+    return True
+
+def check_overlaps_strict(bboxes: List[BBox], max_print: int = 5) -> int:
+    cnt = 0
+    n = len(bboxes)
+    for i in range(n):
+        for j in range(i+1, n):
+            if bbox_overlap_strict(bboxes[i], bboxes[j]):
+                cnt += 1
+                if cnt <= max_print:
+                    print(f"[OVERLAP(strict)] {i} {bboxes[i]} <-> {j} {bboxes[j]}")
+    return cnt
+
+# ----------------- random points -----------------
+def generate_random_points(n: int, seed: int = 42) -> List[Point]:
+    rng = random.Random(seed)
+    idxs = rng.sample(range(W * H), n)
+    return [(i % W, i // W) for i in idxs]
+
+# ----------------- strict strip inside a slice -----------------
+def split_into_strips_strict(points_sorted: List[Point], strip_size: int, mode: str) -> List[List[Point]]:
+    """
+    mode="H": points_sorted sorted by (y,x). Avoid splitting same y across strips (helps strict boundary).
+    mode="V": points_sorted sorted by (x,y). Avoid splitting same x across strips.
+    """
+    n = len(points_sorted)
+    strips: List[List[Point]] = []
+    strip_size = max(4, strip_size)
+
+    axis = 1 if mode == "H" else 0  # H: y, V: x
+
+    i = 0
+    while i < n:
+        cur: List[Point] = []
+
+        # take up to strip_size but keep same axis-value together at the boundary
+        cut = min(n, i + strip_size)
+        cur = points_sorted[i:cut]
+        if cut < n:
+            last_axis = points_sorted[cut-1][axis]
+            while cut < n and points_sorted[cut][axis] == last_axis:
+                cur.append(points_sorted[cut])
+                cut += 1
+
+        i = cut
+        if strips and len(cur) < 4:
+            strips[-1].extend(cur)
+        else:
+            strips.append(cur)
+
+    return strips
+
+def build_houses_in_strip_strict(strip_pts: List[Point], mode: str, direction: int) -> List[BBox]:
+    """
+    mode="H": horizontal strip -> internal sweep along x
+    mode="V": vertical strip   -> internal sweep along y
+    direction:
+      +1: H left->right, V top->bottom
+      -1: H right->left, V bottom->top
+    strict: boundary-touch along sweep axis is forbidden -> merge into previous house
+    """
+    assert mode in ("H", "V")
+    assert direction in (+1, -1)
+
+    if mode == "H":
+        # sort by x
+        pts = sorted(strip_pts, key=(lambda p: (p[0], p[1])) if direction == +1 else (lambda p: (-p[0], p[1])))
+        def conflict(prev: BBox, new: BBox) -> bool:
+            # need prev_xmax < new_xmin (strict separation)
+            return (new[0] <= prev[2]) if direction == +1 else (new[2] >= prev[0])
+    else:
+        # sort by y
+        pts = sorted(strip_pts, key=(lambda p: (p[1], p[0])) if direction == +1 else (lambda p: (-p[1], p[0])))
+        def conflict(prev: BBox, new: BBox) -> bool:
+            # need prev_ymax < new_ymin
+            return (new[1] <= prev[3]) if direction == +1 else (new[3] >= prev[1])
+
+    groups: List[List[Point]] = []
+    bboxes: List[BBox] = []
+
+    i = 0
+    while i + 4 <= len(pts):
+        g = pts[i:i+4]
+        bb = bbox_of(g)
+
+        if not bboxes:
+            groups.append(g)
+            bboxes.append(bb)
+        else:
+            if conflict(bboxes[-1], bb):
+                groups[-1].extend(g)
+                bboxes[-1] = bbox_of(groups[-1])
+            else:
+                groups.append(g)
+                bboxes.append(bb)
+
+        i += 4
+
+    # leftover -> last house absorbs
+    if i < len(pts):
+        rem = pts[i:]
+        if not bboxes:
+            bboxes.append(bbox_of(rem))
+        else:
+            groups[-1].extend(rem)
+            bboxes[-1] = bbox_of(groups[-1])
+
+    return bboxes
+
+def solve_slice_strict(points_in_slice: List[Point],
+                       strip_size: int = 80,
+                       modes=("H","V"),
+                       directions=(+1,-1)) -> Optional[List[BBox]]:
+    """
+    Slice 내부에서 strict 조건(경계 접촉도 금지)으로 house 생성 시도.
+    여러 (mode, direction) 중 겹침 0인 해가 있으면, score가 가장 큰 걸 반환.
+    """
+    best = None  # (score, bboxes)
+    for mode in modes:
+        for direction in directions:
+            if mode == "H":
+                pts_sorted = sorted(points_in_slice, key=lambda p: (p[1], p[0]))
+            else:
+                pts_sorted = sorted(points_in_slice, key=lambda p: (p[0], p[1]))
+
+            strips = split_into_strips_strict(pts_sorted, strip_size=strip_size, mode=mode)
+            bboxes: List[BBox] = []
+            for st in strips:
+                bboxes.extend(build_houses_in_strip_strict(st, mode=mode, direction=direction))
+
+            if check_overlaps_strict(bboxes, max_print=0) != 0:
+                continue
+
+            sc = score_from_bboxes(bboxes)
+            if best is None or sc > best[0]:
+                best = (sc, bboxes)
+
+    return None if best is None else best[1]
+
+# ----------------- column-interval backtracking (rollback) -----------------
+def build_column_index(points: List[Point]) -> Tuple[List[int], List[int], Dict[int, List[Point]]]:
+    """
+    returns:
+      xs: sorted unique x columns that have at least 1 point
+      pref: prefix sums of counts per xs (len = len(xs)+1)
+      col_points: map x -> list of points in that column
+    """
+    col_points: Dict[int, List[Point]] = {}
+    for x,y in points:
+        col_points.setdefault(x, []).append((x,y))
+
+    xs = sorted(col_points.keys())
+    counts = [len(col_points[x]) for x in xs]
+
+    pref = [0]
+    s = 0
+    for c in counts:
+        s += c
+        pref.append(s)
+
+    return xs, pref, col_points
+
+def interval_count(pref: List[int], i: int, j: int) -> int:
+    # inclusive [i..j] on xs-index
+    return pref[j+1] - pref[i]
+
+def collect_points_for_interval(xs: List[int], col_points: Dict[int, List[Point]], i: int, j: int) -> List[Point]:
+    pts: List[Point] = []
+    for k in range(i, j+1):
+        pts.extend(col_points[xs[k]])
+    return pts
+
+def solve_by_column_intervals(points: List[Point],
+                              target_points_per_slice: int = 80,
+                              max_span_cols: int = 200,
+                              strip_size_inside: int = 80) -> Tuple[List[BBox], float, Dict]:
+    """
+    왼쪽(x 작은)부터:
+      - 열 구간 [i..j] 점 개수 %4==0 인 후보만 선택
+      - slice 내부를 strict로 해결 가능하면 확정, 아니면 rollback
+    """
+    xs, pref, col_points = build_column_index(points)
+    m = len(xs)
+
+    memo_fail = set()  # start index i that is proven impossible
+
+    def backtrack(i: int) -> Optional[List[BBox]]:
+        if i >= m:
+            return []  # done
+
+        if i in memo_fail:
+            return None
+
+        # 후보 j 생성: i..min(i+max_span_cols-1, m-1)
+        jmax = min(m-1, i + max_span_cols - 1)
+        candidates = []
+        for j in range(i, jmax+1):
+            cnt = interval_count(pref, i, j)
+            if cnt >= 4 and cnt % 4 == 0:
+                # heuristic: prefer count near target_points_per_slice
+                candidates.append((abs(cnt - target_points_per_slice), -cnt, j, cnt))
+        # 가까운 것부터(그리고 더 큰 cnt 약간 선호)
+        candidates.sort()
+
+        for _, __, j, cnt in candidates:
+            slice_pts = collect_points_for_interval(xs, col_points, i, j)
+
+            # slice 내부 해결 시도
+            slice_bboxes = solve_slice_strict(
+                slice_pts,
+                strip_size=strip_size_inside,
+                modes=("H","V"),
+                directions=(+1,-1),
+            )
+            if slice_bboxes is None:
+                continue
+
+            # 다음 구간 재귀
+            rest = backtrack(j+1)
+            if rest is None:
+                continue
+
+            # 서로 다른 x-구간이라 사실상 겹치기 어렵지만, strict로 최종 한 번 체크
+            merged = slice_bboxes + rest
+            if check_overlaps_strict(merged, max_print=0) != 0:
+                continue
+
+            return merged
+
+        memo_fail.add(i)
+        return None
+
+    bboxes = backtrack(0)
+    if bboxes is None:
+        return [], float("-inf"), {"status": "fail"}
+
+    sc = score_from_bboxes(bboxes)
+    meta = {
+        "status": "ok",
+        "houses": len(bboxes),
+        "strict_overlaps": check_overlaps_strict(bboxes, max_print=0),
+        "unique_x_cols": len(xs),
+        "target_points_per_slice": target_points_per_slice,
+        "max_span_cols": max_span_cols,
+        "strip_size_inside": strip_size_inside,
+    }
+    return bboxes, sc, meta
+
+# ----------------- demo -----------------
+if __name__ == "__main__":
+    pts = generate_random_points(2000, seed=42)
+
+    bboxes, sc, meta = solve_by_column_intervals(
+        pts,
+        target_points_per_slice=80,  # 구간에 들어갈 점 개수 목표(휴리스틱)
+        max_span_cols=200,           # 한 구간이 커지는 걸 제한(백트래킹 폭 제한)
+        strip_size_inside=80         # 구간 내부 strip 파라미터
+    )
+
+    print("Score:", sc)
+    print("Meta:", meta)
+    print("Strict overlap pairs:", check_overlaps_strict(bboxes, max_print=5))
