@@ -1,0 +1,171 @@
+import random
+from typing import List, Tuple
+
+Point = Tuple[int, int]
+BBox  = Tuple[int, int, int, int]  # (xmin, ymin, xmax, ymax)
+
+W = 1024
+H = 1024
+
+# ---------- bbox / score ----------
+def bbox_of(pts: List[Point]) -> BBox:
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+def area(b: BBox) -> int:
+    x1,y1,x2,y2 = b
+    return (x2-x1+1) * (y2-y1+1)
+
+def sum_sq(HH: int) -> int:
+    return (HH - 1) * HH * (2*HH - 1) // 6
+
+def score_from_bboxes(bboxes: List[BBox]) -> float:
+    HH = len(bboxes)
+    if HH == 0:
+        return float("-inf")
+    add = sum_sq(HH)
+    areas = [area(b) for b in bboxes]
+    mu = sum(areas) / HH
+    pen = sum(abs(a - mu) / 10.0 for a in areas)
+    return add - pen
+
+# ---------- strict overlap (boundary-touch is overlap) ----------
+def bbox_overlap_strict(b1: BBox, b2: BBox) -> bool:
+    # 분리 조건이 "엄격(<)"이어야 경계 접촉도 겹침으로 잡힘
+    x1,y1,x2,y2 = b1
+    a1,b1y,a2,b2y = b2
+    if x2 < a1 or a2 < x1: return False
+    if y2 < b1y or b2y < y1: return False
+    return True
+
+def check_overlaps_strict(bboxes: List[BBox], max_print: int = 5) -> int:
+    cnt = 0
+    n = len(bboxes)
+    for i in range(n):
+        for j in range(i+1, n):
+            if bbox_overlap_strict(bboxes[i], bboxes[j]):
+                cnt += 1
+                if cnt <= max_print:
+                    print(f"[OVERLAP(strict)] {i} {bboxes[i]} <-> {j} {bboxes[j]}")
+    return cnt
+
+# ---------- data ----------
+def generate_random_points(n: int, seed: int = 42) -> List[Point]:
+    rng = random.Random(seed)
+    idxs = rng.sample(range(W * H), n)
+    return [(i % W, i // W) for i in idxs]
+
+# ---------- strip split with strict separation on the strip axis ----------
+def split_into_strips_strict(points_sorted: List[Point], strip_size: int, mode: str) -> List[List[Point]]:
+    """
+    mode="H": y-정렬된 points_sorted를 strip_size 개수로 모으되,
+              스트립 경계는 반드시 max_y(curr) < min_y(next) 되게 컷
+    mode="V": x-정렬된 points_sorted를 strip_size 개수로 모으되,
+              스트립 경계는 반드시 max_x(curr) < min_x(next)
+    """
+    n = len(points_sorted)
+    strips: List[List[Point]] = []
+    strip_size = max(4, strip_size)
+
+    i = 0
+    while i < n:
+        cur: List[Point] = []
+        if mode == "H":
+            cur_max = -1
+            while i < n and (len(cur) < strip_size or points_sorted[i][1] == cur_max):
+                # cur_max와 같은 y는 같은 스트립에 묶어서 '경계 접촉(y)' 방지
+                x,y = points_sorted[i]
+                cur.append((x,y))
+                cur_max = max(cur_max, y)
+                i += 1
+        else:
+            cur_max = -1
+            while i < n and (len(cur) < strip_size or points_sorted[i][0] == cur_max):
+                x,y = points_sorted[i]
+                cur.append((x,y))
+                cur_max = max(cur_max, x)
+                i += 1
+
+        # 혹시 너무 작게 남는 꼬리를 방지(마지막에 <4 남으면 합치기)
+        if strips and len(cur) < 4:
+            strips[-1].extend(cur)
+        else:
+            strips.append(cur)
+
+    return strips
+
+# ---------- build houses in strip, enforcing "no boundary touch" inside strip ----------
+def build_houses_in_strip_strict(strip_pts: List[Point], mode: str) -> List[BBox]:
+    """
+    mode="H": strip 내부는 x 오름차순으로 훑으며 4개씩 후보 생성.
+              새 bbox의 xmin <= prev_xmax 이면(경계 접촉 포함) 새로 만들지 말고 prev에 merge.
+    mode="V": strip 내부는 y 오름차순, 새 bbox의 ymin <= prev_ymax 이면 merge.
+    """
+    if mode == "H":
+        pts = sorted(strip_pts, key=lambda p: (p[0], p[1]))  # x, y
+        axis_min = 0  # xmin
+        axis_max = 2  # xmax
+    else:
+        pts = sorted(strip_pts, key=lambda p: (p[1], p[0]))  # y, x
+        axis_min = 1  # ymin
+        axis_max = 3  # ymax
+
+    groups: List[List[Point]] = []
+    bboxes: List[BBox] = []
+
+    i = 0
+    while i + 4 <= len(pts):
+        g = pts[i:i+4]
+        bb = bbox_of(g)
+
+        if not bboxes:
+            groups.append(g)
+            bboxes.append(bb)
+        else:
+            prev_bb = bboxes[-1]
+            # "경계도 안 닿게" 하려면 prev_max < new_min 이어야 함
+            if bb[axis_min] <= prev_bb[axis_max]:
+                # 충돌/접촉 -> 이전 house에 흡수(merge)
+                groups[-1].extend(g)
+                bboxes[-1] = bbox_of(groups[-1])
+            else:
+                groups.append(g)
+                bboxes.append(bb)
+        i += 4
+
+    # 남는 1~3개 자투리 -> 마지막 house에 흡수(스트립 내부라 안전하게 관리 가능)
+    if i < len(pts):
+        rem = pts[i:]
+        if not bboxes:
+            bboxes.append(bbox_of(rem))
+        else:
+            groups[-1].extend(rem)
+            bboxes[-1] = bbox_of(groups[-1])
+
+    return bboxes
+
+# ---------- solve ----------
+def solve_strip_strict(points: List[Point], strip_size: int, mode: str = "H") -> Tuple[List[BBox], float]:
+    if mode == "H":
+        pts_sorted = sorted(points, key=lambda p: (p[1], p[0]))  # y, x
+    else:
+        pts_sorted = sorted(points, key=lambda p: (p[0], p[1]))  # x, y
+
+    strips = split_into_strips_strict(pts_sorted, strip_size=strip_size, mode=mode)
+
+    bboxes: List[BBox] = []
+    for strip in strips:
+        bboxes.extend(build_houses_in_strip_strict(strip, mode=mode))
+
+    sc = score_from_bboxes(bboxes)
+    return bboxes, sc
+
+# ---------- demo ----------
+if __name__ == "__main__":
+    pts = generate_random_points(2000, seed=42)
+
+    for mode in ["H", "V"]:
+        bboxes, sc = solve_strip_strict(pts, strip_size=40, mode=mode)
+        ov = check_overlaps_strict(bboxes, max_print=3)
+        print(mode, "houses=", len(bboxes), "score=", sc, "strict_overlaps=", ov)
