@@ -1,0 +1,255 @@
+import random
+from typing import List, Tuple, Dict, Optional
+
+Point = Tuple[int, int]
+BBox  = Tuple[int, int, int, int]
+
+W = 1024
+H = 1024
+
+# ----------------- bbox / score -----------------
+def bbox_of(pts: List[Point]) -> BBox:
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+def area(b: BBox) -> int:
+    x1,y1,x2,y2 = b
+    return (x2-x1+1)*(y2-y1+1)
+
+def sum_sq(HH: int) -> int:
+    return (HH - 1) * HH * (2*HH - 1) // 6
+
+def score_from_bboxes_exact(bboxes: List[BBox]) -> float:
+    HH = len(bboxes)
+    if HH == 0:
+        return float("-inf")
+    add = sum_sq(HH)
+    areas = [area(b) for b in bboxes]
+    mu = sum(areas) / HH
+    pen = sum(abs(a - mu) / 10.0 for a in areas)
+    return add - pen
+
+# ----------------- STRICT overlap (boundary-touch counts as overlap) -----------------
+def bbox_overlap_strict(b1: BBox, b2: BBox) -> bool:
+    x1,y1,x2,y2 = b1
+    a1,b1y,a2,b2y = b2
+    if x2 < a1 or a2 < x1: return False
+    if y2 < b1y or b2y < y1: return False
+    return True
+
+def overlaps_any_strict(bb: BBox, bboxes: List[BBox]) -> bool:
+    for b in bboxes:
+        if bbox_overlap_strict(bb, b):
+            return True
+    return False
+
+# ----------------- random points -----------------
+def generate_random_points(n: int, seed: int = 42) -> List[Point]:
+    rng = random.Random(seed)
+    idxs = rng.sample(range(W*H), n)
+    return [(i % W, i // W) for i in idxs]
+
+# ----------------- strict strip split -----------------
+def split_into_strips_strict(points_sorted: List[Point], strip_size: int, mode: str) -> List[List[Point]]:
+    """
+    mode="H": sorted by (y,x) or (-y,x), avoid splitting same y across strips.
+    mode="V": sorted by (x,y) or (-x,y), avoid splitting same x across strips.
+    """
+    n = len(points_sorted)
+    strips: List[List[Point]] = []
+    strip_size = max(4, strip_size)
+    axis = 1 if mode == "H" else 0
+
+    i = 0
+    while i < n:
+        cut = min(n, i + strip_size)
+        cur = points_sorted[i:cut]
+        if cut < n:
+            last_axis = points_sorted[cut-1][axis]
+            while cut < n and points_sorted[cut][axis] == last_axis:
+                cur.append(points_sorted[cut])
+                cut += 1
+        i = cut
+        if strips and len(cur) < 4:
+            strips[-1].extend(cur)
+        else:
+            strips.append(cur)
+    return strips
+
+# ----------------- ordering inside strip -----------------
+def sort_in_strip(pts: List[Point], mode: str, direction: int) -> List[Point]:
+    """
+    mode="H": sweep axis = x, direction +1: L->R, -1: R->L
+    mode="V": sweep axis = y, direction +1: T->B, -1: B->T
+    """
+    if mode == "H":
+        return sorted(pts, key=(lambda p: (p[0], p[1])) if direction == +1 else (lambda p: (-p[0], p[1])))
+    else:
+        return sorted(pts, key=(lambda p: (p[1], p[0])) if direction == +1 else (lambda p: (-p[1], p[0])))
+
+def pack_ordered(ordered_pts: List[Point]) -> Tuple[List[List[Point]], List[Point]]:
+    groups: List[List[Point]] = []
+    i = 0
+    while i + 4 <= len(ordered_pts):
+        groups.append(ordered_pts[i:i+4])
+        i += 4
+    return groups, ordered_pts[i:]  # leftover 0..3
+
+def groups_to_bboxes(groups: List[List[Point]]) -> List[BBox]:
+    return [bbox_of(g) for g in groups]
+
+# ----------------- generate ALL actions for one strip -----------------
+def all_actions_for_strip(strip_pts: List[Point],
+                          carry_in: List[Point],
+                          mode: str,
+                          direction: int,
+                          prev_bboxes: List[BBox]) -> List[Tuple[str, int, List[BBox], List[Point]]]:
+    """
+    returns list of (kind, extra, new_bboxes, carry_out)
+      kind in {"CARRY", "ABSORB"}
+      extra in 0..3  (reserved points moved to next strip on purpose)
+    strict overlap 위반이면 후보 제외.
+    """
+    pts = sort_in_strip(strip_pts + carry_in, mode, direction)
+    out = []
+
+    for extra in (0,1,2,3):
+        if extra > 0 and len(pts) >= extra:
+            reserved = pts[-extra:]
+            core = pts[:-extra]
+        else:
+            reserved = []
+            core = pts
+
+        groups, leftover = pack_ordered(core)
+        base_bboxes = groups_to_bboxes(groups)
+
+        # ---- CARRY 후보 ----
+        carry = sort_in_strip(leftover + reserved, mode, direction)
+        bboxesA = base_bboxes[:]
+        # carry를 0..3으로 유지: 넘치면 앞에서 4개씩 bbox로 만들어 추가
+        while len(carry) > 3:
+            bb = bbox_of(carry[:4])
+            carry = carry[4:]
+            bboxesA.append(bb)
+
+        ok = True
+        for bb in bboxesA:
+            if overlaps_any_strict(bb, prev_bboxes):
+                ok = False
+                break
+        if ok:
+            out.append(("CARRY", extra, bboxesA, carry))
+
+        # ---- ABSORB 후보 ----
+        if groups:
+            groupsB = [g[:] for g in groups]
+            if leftover or reserved:
+                groupsB[-1].extend(leftover + reserved)
+            bboxesB = groups_to_bboxes(groupsB)
+
+            ok = True
+            for bb in bboxesB:
+                if overlaps_any_strict(bb, prev_bboxes):
+                    ok = False
+                    break
+            if ok:
+                out.append(("ABSORB", extra, bboxesB, []))
+
+    return out
+
+# ----------------- EXHAUSTIVE DFS over all strips -----------------
+def exhaustive_solve(points: List[Point],
+                     strip_size: int,
+                     mode: str,
+                     direction: int,
+                     use_memo: bool = False,
+                     memo: Optional[Dict] = None):
+    """
+    진짜 '모든 케이스' DFS.
+    - use_memo=False: 완전한 의미의 전수 탐색(하지만 거의 끝나지 않을 수 있음)
+    - use_memo=True : (index, carry) 기반 메모로 가지치기 -> 전수 탐색은 아님(동일 상태 중복 제거)
+    """
+    if mode == "H":
+        pts_sorted = sorted(points, key=(lambda p: (p[1], p[0])) if direction == +1 else (lambda p: (-p[1], p[0])))
+    else:
+        pts_sorted = sorted(points, key=(lambda p: (p[0], p[1])) if direction == +1 else (lambda p: (-p[0], p[1])))
+
+    strips = split_into_strips_strict(pts_sorted, strip_size=strip_size, mode=mode)
+
+    best_score = float("-inf")
+    best_bboxes: List[BBox] = []
+    best_path: List[Tuple[int, str, int]] = []
+
+    if memo is None:
+        memo = {}
+
+    def carry_key(carry: List[Point]) -> Tuple[Point, ...]:
+        # carry는 순서 영향 있으니 정렬해서 상태키로 씀(보수적)
+        return tuple(sorted(carry))
+
+    def dfs(si: int, prev_bboxes: List[BBox], carry: List[Point], path: List[Tuple[int, str, int]]):
+        nonlocal best_score, best_bboxes, best_path
+
+        if use_memo:
+            key = (si, carry_key(carry))
+            # memo에 "이 상태에서 이미 best_score 이상 만들기 불가" 같은 상한을 두고 pruning하려면
+            # 더 복잡한 bound가 필요. 여기선 단순 중복 제거만(최대 H를 저장).
+            prev_bestH = memo.get(key, -1)
+            if len(prev_bboxes) <= prev_bestH:
+                return
+            memo[key] = max(prev_bestH, len(prev_bboxes))
+
+        if si == len(strips):
+            # 마지막 carry 처리
+            bboxes_final = prev_bboxes[:]
+            if carry:
+                bb = bbox_of(carry)
+                if overlaps_any_strict(bb, bboxes_final):
+                    return
+                bboxes_final.append(bb)
+
+            sc = score_from_bboxes_exact(bboxes_final)
+            if sc > best_score:
+                best_score = sc
+                best_bboxes = bboxes_final
+                best_path = path[:]
+            return
+
+        actions = all_actions_for_strip(strips[si], carry, mode, direction, prev_bboxes)
+        # 전수 탐색이니까 순서 자체는 중요하지 않지만, 좋은 해를 빨리 찾으면 디버깅에 도움
+        # 여기선 bboxes 많이 만드는 후보를 먼저
+        actions.sort(key=lambda x: len(x[2]), reverse=True)
+
+        for kind, extra, new_bbs, carry_out in actions:
+            # strict overlap: new_bbs 내부는 위에서 생성 과정상 겹칠 수 있어도,
+            # prev와만 체크했음. 내부도 안전하게 체크(필요시).
+            # 내부 체크는 비용이 커서 여기선 생략(보통 pack 과정에서 중복 적음).
+            dfs(
+                si + 1,
+                prev_bboxes + new_bbs,
+                carry_out,
+                path + [(si, kind, extra)]
+            )
+
+    dfs(0, [], [], [])
+    return best_bboxes, best_score, {"mode": mode, "direction": direction, "strip_size": strip_size,
+                                    "use_memo": use_memo, "best_path_len": len(best_path)}
+
+# ----------------- demo -----------------
+if __name__ == "__main__":
+    pts = generate_random_points(2000, seed=42)
+
+    # ⚠️ N=2000에서는 전수탐색이 사실상 끝나지 않을 수 있음.
+    # 작은 N으로 먼저 테스트 추천.
+    bboxes, sc, meta = exhaustive_solve(
+        pts,
+        strip_size=40,
+        mode="H",
+        direction=+1,
+        use_memo=False  # True로 하면 중복 제거(전수는 아님, 그래도 훨씬 현실적)
+    )
+
+    print("Score:", sc)
+    print("Meta:", meta)
