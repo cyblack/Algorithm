@@ -1,0 +1,266 @@
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Set, Optional
+import random
+import itertools
+
+Point = Tuple[int, int]  # (x, y)
+
+@dataclass
+class House:
+    xmin: int
+    xmax: int
+    ymin: int
+    ymax: int
+    area: int
+    chosen: List[Point]
+    consumed: List[Point]
+
+def rect_area(xmin, xmax, ymin, ymax) -> int:
+    return (xmax - xmin) * (ymax - ymin)
+
+def houses_overlap(a: House, b: House) -> bool:
+    return not (a.xmax < b.xmin or b.xmax < a.xmin or a.ymax < b.ymin or b.ymax < a.ymin)
+
+def validate_solution(points: List[Point], houses: List[House]) -> None:
+    consumed_all: Dict[Point, int] = {}
+    for h in houses:
+        for p in h.consumed:
+            consumed_all[p] = consumed_all.get(p, 0) + 1
+
+    missing = [p for p in points if p not in consumed_all]
+    dup = [p for p, c in consumed_all.items() if c > 1]
+    if missing:
+        raise AssertionError(f"소모되지 않은 점 {len(missing)}개")
+    if dup:
+        raise AssertionError(f"중복 소모된 점 {len(dup)}개")
+
+    for i in range(len(houses)):
+        for j in range(i + 1, len(houses)):
+            if houses_overlap(houses[i], houses[j]):
+                raise AssertionError(f"House overlap: {i} vs {j}")
+
+def score_solution(houses: List[House]) -> float:
+    H = len(houses)
+    add = sum(i * i for i in range(H))
+    areas = [h.area for h in houses]
+    mean_area = sum(areas) / H if H else 0.0
+    dec = sum(abs(a - mean_area) / 10.0 for a in areas)
+    return add - dec
+
+# -----------------------------
+# 1) variable strips (점수/유효해 안정용)
+# -----------------------------
+def build_variable_strips(points: List[Point], strip_w: int = 64) -> List[Tuple[int, int, List[Point]]]:
+    buckets: Dict[int, List[Point]] = {}
+    for x, y in points:
+        b = x // strip_w
+        buckets.setdefault(b, []).append((x, y))
+
+    max_bucket = max(buckets.keys()) if buckets else 0
+
+    strips = []
+    acc_pts: List[Point] = []
+    acc_left = 0
+
+    def bucket_range(bi: int) -> Tuple[int, int]:
+        left = bi * strip_w
+        right = min(1024, (bi + 1) * strip_w)
+        return left, right
+
+    acc_left, _ = bucket_range(0)
+
+    for bi in range(0, max_bucket + 1):
+        left, right = bucket_range(bi)
+        acc_pts.extend(buckets.get(bi, []))
+
+        if len(acc_pts) >= 4 and (len(acc_pts) % 4 == 0):
+            strips.append((acc_left, right, acc_pts))
+            acc_pts = []
+            acc_left = right
+
+    if acc_pts:
+        raise ValueError(
+            f"남은 점 {len(acc_pts)}개가 4의 배수가 아닙니다. "
+            f"N이 4의 배수인지 확인하거나 strip_w를 바꿔보세요."
+        )
+    return strips
+
+# -----------------------------
+# 2) y-prefix + x-window chosen picker
+# -----------------------------
+def pick_chosen_y_prefix_x_window(
+    cand_sorted: List[Point],
+    K: int = 12,
+    dx: int = 48,
+    max_trials: int = 200,
+    wA: float = 1.0,
+    wC: float = 80.0,
+    rnd: Optional[random.Random] = None
+) -> List[Point]:
+    """
+    cand_sorted: 현재 unused 점들을 (y,x)로 정렬한 리스트
+    - anchor = cand_sorted[0] 반드시 포함
+    - 후보풀 = cand_sorted[:K] (y-prefix)
+    - x-window = |x - anchor.x| <= dx 로 필터
+    - anchor + (pool에서 3개) 조합을 평가해 best 선택
+    """
+    if rnd is None:
+        rnd = random
+
+    anchor = cand_sorted[0]
+
+    # y-prefix
+    prefix = cand_sorted[:K]
+
+    # x-window
+    pool = [p for p in prefix if abs(p[0] - anchor[0]) <= dx]
+
+    # anchor는 반드시 포함
+    if anchor not in pool:
+        pool.append(anchor)
+
+    # pool이 너무 작으면 dx를 강제로 늘리기보단,
+    # prefix 전체로 fallback (안정성)
+    if len(pool) < 4:
+        pool = prefix[:]  # y-prefix만 사용
+
+    # anchor 제외 후보들
+    others = [p for p in pool if p != anchor]
+    if len(others) < 3:
+        # 그래도 부족하면 cand_sorted 전체에서 보충(최후 fallback)
+        others = [p for p in cand_sorted if p != anchor]
+        if len(others) < 3:
+            raise ValueError("chosen을 만들 후보가 4개 미만입니다.")
+
+    combos = list(itertools.combinations(others, 3))
+    if len(combos) > max_trials:
+        combos = rnd.sample(combos, max_trials)
+
+    best_cost = float("inf")
+    best_chosen = None
+
+    # 평가 시 consumed_cnt를 빠르게 계산하려면 cand_sorted 일부만 보되,
+    # 안전하게 K~(K*2) 정도만 쓰는 게 실전에서 좋음.
+    # 여기선 단순히 cand_sorted 전체를 보되, 큰 N이면 느려질 수 있음.
+    for c3 in combos:
+        chosen = [anchor, *c3]
+        xs = [p[0] for p in chosen]
+        ys = [p[1] for p in chosen]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+
+        area = rect_area(xmin, xmax, ymin, ymax)
+
+        consumed_cnt = 0
+        # cand_sorted는 unused만 포함이므로 여기서 내부 점 세면 consumed가 됨
+        for x, y in cand_sorted:
+            if xmin <= x <= xmax and ymin <= y <= ymax:
+                consumed_cnt += 1
+
+        cost = wA * area + wC * (consumed_cnt - 4)
+        if cost < best_cost:
+            best_cost = cost
+            best_chosen = chosen
+
+    return best_chosen  # type: ignore
+
+# -----------------------------
+# 3) build houses in strip using the picker
+# -----------------------------
+def build_houses_in_strip_y_prefix_x_window(
+    strip_points: List[Point],
+    K: int = 12,
+    dx: int = 48,
+    max_trials: int = 200,
+    wA: float = 1.0,
+    wC: float = 80.0,
+    seed: int = 0
+) -> List[House]:
+    pts = sorted(strip_points, key=lambda p: (p[1], p[0]))
+    unused: Set[Point] = set(pts)
+    houses: List[House] = []
+    rnd = random.Random(seed)
+
+    while unused:
+        cand = [p for p in pts if p in unused]  # y-정렬 유지
+        if len(cand) < 4:
+            raise ValueError("스트립 내 남은 점이 4개 미만입니다.")
+
+        chosen = pick_chosen_y_prefix_x_window(
+            cand_sorted=cand,
+            K=min(K, len(cand)),
+            dx=dx,
+            max_trials=max_trials,
+            wA=wA,
+            wC=wC,
+            rnd=rnd
+        )
+
+        xs = [p[0] for p in chosen]
+        ys = [p[1] for p in chosen]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+
+        consumed = []
+        for p in cand:
+            x, y = p
+            if xmin <= x <= xmax and ymin <= y <= ymax:
+                consumed.append(p)
+
+        # chosen은 반드시 포함
+        for p in chosen:
+            if p not in consumed:
+                consumed.append(p)
+
+        for p in consumed:
+            if p in unused:
+                unused.remove(p)
+
+        area = rect_area(xmin, xmax, ymin, ymax)
+        houses.append(House(xmin, xmax, ymin, ymax, area, chosen=chosen, consumed=consumed))
+
+    return houses
+
+# -----------------------------
+# 4) solver
+# -----------------------------
+def solve(points: List[Point], strip_w: int = 64,
+          K: int = 12, dx: int = 48, max_trials: int = 200,
+          wA: float = 1.0, wC: float = 80.0, seed: int = 0) -> Tuple[List[House], float]:
+    strips = build_variable_strips(points, strip_w=strip_w)
+    all_houses: List[House] = []
+
+    for i, (xL, xR, sp) in enumerate(strips):
+        hs = build_houses_in_strip_y_prefix_x_window(
+            sp, K=K, dx=dx, max_trials=max_trials, wA=wA, wC=wC, seed=seed + i
+        )
+        all_houses.extend(hs)
+
+    validate_solution(points, all_houses)
+    return all_houses, score_solution(all_houses)
+
+# -----------------------------
+# quick test
+# -----------------------------
+if __name__ == "__main__":
+    random.seed(0)
+    N = 4000  # 4의 배수
+    used = set()
+    pts: List[Point] = []
+    while len(pts) < N:
+        x = random.randrange(1024)
+        y = random.randrange(1024)
+        if (x, y) not in used:
+            used.add((x, y))
+            pts.append((x, y))
+
+    houses, sc = solve(
+        pts,
+        strip_w=64,
+        K=12, dx=48, max_trials=200,
+        wA=1.0, wC=80.0,
+        seed=0
+    )
+    print("houses:", len(houses))
+    print("score:", sc)
+    print("mean area:", sum(h.area for h in houses) / len(houses))
