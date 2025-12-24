@@ -1,0 +1,78 @@
+import itertools
+import random
+from typing import List, Tuple, Optional
+
+Point = Tuple[int, int]
+
+def pick_chosen_y_prefix_x_window(
+    cand_sorted: List[Point],
+    K: int = 12,
+    dx: int = 48,
+    max_trials: int = 200,
+    wA: float = 1.0,
+    wC: float = 80.0,
+    wM: float = 10_000.0,   # mod 깨짐 페널티(안전망)
+    rnd: Optional[random.Random] = None
+) -> List[Point]:
+    """
+    cand_sorted: 현재 unused 점들을 (y,x)로 정렬한 리스트
+    - anchor = cand_sorted[0] 반드시 포함
+    - 후보풀 = y-prefix K + x-window(|x-anchor.x|<=dx)
+    - 평가 시 '남은 개수 %4 == 0' 유지되는 조합 우선
+    """
+    if rnd is None:
+        rnd = random
+
+    n = len(cand_sorted)
+    anchor = cand_sorted[0]
+
+    prefix = cand_sorted[:min(K, n)]
+    pool = [p for p in prefix if abs(p[0] - anchor[0]) <= dx]
+    if anchor not in pool:
+        pool.append(anchor)
+    if len(pool) < 4:
+        pool = prefix[:]  # fallback
+
+    others = [p for p in pool if p != anchor]
+    if len(others) < 3:
+        others = [p for p in cand_sorted if p != anchor]
+        if len(others) < 3:
+            raise ValueError("chosen 후보가 4개 미만입니다.")
+
+    combos = list(itertools.combinations(others, 3))
+    if len(combos) > max_trials:
+        combos = rnd.sample(combos, max_trials)
+
+    best_cost = float("inf")
+    best_chosen = None
+
+    for c3 in combos:
+        chosen = [anchor, *c3]
+        xs = [p[0] for p in chosen]
+        ys = [p[1] for p in chosen]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+
+        area = (xmax - xmin) * (ymax - ymin)
+
+        # cand_sorted는 unused 전체(또는 충분히 큰 prefix)라고 가정
+        consumed_cnt = 0
+        for x, y in cand_sorted:
+            if xmin <= x <= xmax and ymin <= y <= ymax:
+                consumed_cnt += 1
+
+        rem = n - consumed_cnt
+
+        # (추천) rem이 0 또는 4의 배수(>=4)면 좋음
+        mod_bad = 0.0
+        if rem != 0:
+            if rem < 4 or (rem % 4 != 0):
+                # 가능한 조합을 완전히 버리면 전부 막히는 경우가 있어 페널티로 처리
+                mod_bad = wM + (rem % 4) * 1000.0
+
+        cost = wA * area + wC * (consumed_cnt - 4) + mod_bad
+        if cost < best_cost:
+            best_cost = cost
+            best_chosen = chosen
+
+    return best_chosen  # type: ignore
