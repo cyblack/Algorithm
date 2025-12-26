@@ -1,0 +1,272 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import random
+
+W = H = 1024
+
+# -------------------------
+# Geometry / constraints
+# -------------------------
+@dataclass(frozen=True)
+class Rect:
+    x1: int; y1: int; x2: int; y2: int  # inclusive
+
+    def area(self) -> int:
+        return (self.x2 - self.x1 + 1) * (self.y2 - self.y1 + 1)
+
+def overlap_or_touch(a: Rect, b: Rect) -> bool:
+    # touch forbidden => if not strictly separated, it's conflict
+    if a.x2 < b.x1 or b.x2 < a.x1 or a.y2 < b.y1 or b.y2 < a.y1:
+        return False
+    return True
+
+# -------------------------
+# Region for recursive partition
+# -------------------------
+@dataclass
+class Region:
+    x1: int; y1: int; x2: int; y2: int
+    ids: List[int]
+
+# -------------------------
+# Scoring (optional)
+# -------------------------
+def score_rects(rects: List[Rect]) -> float:
+    n = len(rects)
+    reward = (n - 1) * n * (2 * n - 1) / 6.0 if n > 0 else 0.0
+    if n == 0:
+        return 0.0
+    areas = [r.area() for r in rects]
+    avg = sum(areas) / n
+    penalty = sum(abs(a - avg) / 10.0 for a in areas)
+    return reward - penalty
+
+# -------------------------
+# Helper: find a cut value 'c' with 1-cell gap at coord==c
+# left uses <= c-1, right uses >= c+1
+# and both sides have counts multiple of 4 and >=4
+# -------------------------
+def find_good_cut(ids: List[int], coord: List[int], lo: int, hi: int) -> Optional[int]:
+    if len(ids) < 8:
+        return None
+
+    # count per coordinate value
+    cnt = {}
+    for i in ids:
+        v = coord[i]
+        cnt[v] = cnt.get(v, 0) + 1
+
+    uniq = sorted(cnt.keys())
+    if len(uniq) < 3:
+        return None
+
+    # prefix counts over uniq values
+    pref = []
+    s = 0
+    for v in uniq:
+        s += cnt[v]
+        pref.append((v, s))
+
+    total = len(ids)
+
+    def pref_le(x: int) -> int:
+        ans = 0
+        for v, ps in pref:
+            if v <= x:
+                ans = ps
+            else:
+                break
+        return ans
+
+    # choose a cut that makes both sides splittable (balanced-ish)
+    best_c = None
+    best_balance = -1
+
+    for idx in range(1, len(uniq) - 1):
+        c = uniq[idx]
+        if not (lo < c < hi):
+            continue
+
+        left = pref_le(c - 1)
+        mid = cnt.get(c, 0)
+        right = total - left - mid
+
+        if left >= 4 and right >= 4 and left % 4 == 0 and right % 4 == 0:
+            balance = min(left, right)  # larger min => more likely to split further
+            if balance > best_balance:
+                best_balance = balance
+                best_c = c
+
+    return best_c
+
+# -------------------------
+# Recursive split by axis with 1-cell gap
+# axis = 'x' or 'y'
+# -------------------------
+def split_region_once(region: Region, xs: List[int], ys: List[int], axis: str) -> Optional[Tuple[Region, Region]]:
+    ids = region.ids
+    if len(ids) < 8:
+        return None
+
+    if axis == 'x':
+        c = find_good_cut(ids, xs, region.x1, region.x2)
+        if c is None:
+            return None
+        left_ids = [i for i in ids if xs[i] <= c - 1]
+        right_ids = [i for i in ids if xs[i] >= c + 1]
+        if not left_ids or not right_ids:
+            return None
+        a = Region(region.x1, region.y1, c - 1, region.y2, left_ids)
+        b = Region(c + 1, region.y1, region.x2, region.y2, right_ids)
+        return a, b
+
+    else:
+        c = find_good_cut(ids, ys, region.y1, region.y2)
+        if c is None:
+            return None
+        bot_ids = [i for i in ids if ys[i] <= c - 1]
+        top_ids = [i for i in ids if ys[i] >= c + 1]
+        if not bot_ids or not top_ids:
+            return None
+        a = Region(region.x1, region.y1, region.x2, c - 1, bot_ids)
+        b = Region(region.x1, c + 1, region.x2, region.y2, top_ids)
+        return a, b
+
+# -------------------------
+# Build a rect that consumes exactly the points in this region
+# We return a bbox over the region's points.
+# If bbox becomes degenerate (x1==x2 or y1==y2), we expand by 1 within bounds.
+# -------------------------
+def bbox_rect_for_ids(region: Region, xs: List[int], ys: List[int]) -> Rect:
+    ids = region.ids
+    x1 = min(xs[i] for i in ids); x2 = max(xs[i] for i in ids)
+    y1 = min(ys[i] for i in ids); y2 = max(ys[i] for i in ids)
+
+    # avoid zero width/height (a line) if your problem forbids it
+    if x1 == x2:
+        if x2 < region.x2: x2 += 1
+        elif x1 > region.x1: x1 -= 1
+    if y1 == y2:
+        if y2 < region.y2: y2 += 1
+        elif y1 > region.y1: y1 -= 1
+
+    return Rect(x1, y1, x2, y2)
+
+# -------------------------
+# Core: recursive partition to maximize #rects (houses)
+# Strategy:
+# - keep splitting while possible and while region has "enough" points
+# - prefer splitting that increases #leaves (balanced cut)
+# - if leaf has exactly 4 points => good (one house consuming 4)
+# - else if cannot split => one cleanup house consumes all points in that region
+# -------------------------
+def solve_region(region: Region, xs: List[int], ys: List[int],
+                 prefer_axis: str = 'y',
+                 stop_n: int = 64) -> List[Rect]:
+    """
+    stop_n: if region has <= stop_n points, we still try to split; but you can reduce recursion overhead by stopping earlier.
+    """
+    n = len(region.ids)
+    if n < 4:
+        return []
+    if n == 4:
+        return [bbox_rect_for_ids(region, xs, ys)]
+
+    # Try split (prefer y in-strip to make thin rectangles; tweak as you like)
+    axes = [prefer_axis, 'x' if prefer_axis == 'y' else 'y']
+    for axis in axes:
+        parts = split_region_once(region, xs, ys, axis)
+        if parts is not None:
+            a, b = parts
+            return solve_region(a, xs, ys, prefer_axis=prefer_axis, stop_n=stop_n) + \
+                   solve_region(b, xs, ys, prefer_axis=prefer_axis, stop_n=stop_n)
+
+    # No split found => cleanup rectangle (consumes all remaining in region)
+    return [bbox_rect_for_ids(region, xs, ys)]
+
+# -------------------------
+# Phase 1: variable-width vertical strips (x-splitting)
+# We recursively split by x at "good cuts". This already inserts x-gap lines, so cross-strip touch is impossible.
+# Then within each strip, solve by y-splitting to maximize houses.
+# -------------------------
+def solve(points: List[Tuple[int, int]], seed: int = 0) -> List[Rect]:
+    rng = random.Random(seed)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    n = len(points)
+
+    root = Region(0, 0, W - 1, H - 1, list(range(n)))
+
+    # Build vertical strips by recursively splitting on x
+    # (we do a simple recursion with best cut selection)
+    stack = [root]
+    strips: List[Region] = []
+    while stack:
+        reg = stack.pop()
+        if len(reg.ids) < 8:
+            strips.append(reg)
+            continue
+        parts = split_region_once(reg, xs, ys, 'x')
+        if parts is None:
+            strips.append(reg)
+        else:
+            a, b = parts
+            # DFS
+            stack.append(a)
+            stack.append(b)
+
+    # Solve each strip by further y-partitioning
+    rects: List[Rect] = []
+    for sreg in strips:
+        rects.extend(solve_region(sreg, xs, ys, prefer_axis='y'))
+
+    return rects
+
+# -------------------------
+# Validation (optional)
+# -------------------------
+def validate(points: List[Tuple[int, int]], rects: List[Rect]) -> Tuple[bool, str]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    n = len(points)
+
+    # conflict check
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            if overlap_or_touch(rects[i], rects[j]):
+                return False, f"Rect conflict: {i} vs {j}"
+
+    used = [False] * n
+    for r in rects:
+        inside = []
+        for pid in range(n):
+            if used[pid]:
+                continue
+            if r.x1 <= xs[pid] <= r.x2 and r.y1 <= ys[pid] <= r.y2:
+                inside.append(pid)
+        # consume all inside
+        for pid in inside:
+            used[pid] = True
+
+    rem = sum(1 for v in used if not v)
+    if rem != 0:
+        return False, f"Not all points consumed. remaining={rem}"
+    return True, "OK"
+
+# -------------------------
+# Demo
+# -------------------------
+def gen_random_points(n: int, seed: int = 0) -> List[Tuple[int, int]]:
+    rng = random.Random(seed)
+    s = set()
+    while len(s) < n:
+        s.add((rng.randrange(W), rng.randrange(H)))
+    return list(s)
+
+if __name__ == "__main__":
+    pts = gen_random_points(1200, seed=1)
+    rects = solve(pts, seed=1)
+    ok, msg = validate(pts, rects)
+    print("validate:", ok, msg)
+    print("houses:", len(rects), "score:", score_rects(rects))
