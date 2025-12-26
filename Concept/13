@@ -1,0 +1,478 @@
+"""
+Problem (restate)
+- 1024x1024 grid.
+- N points (1000~1400), all distinct.
+- A House is formed by choosing 4 points; the house rectangle is [minx..maxx] x [miny..maxy] (inclusive).
+- When you build a house, ALL points inside/on that rectangle become "used" (consumed).
+- Houses must not overlap each other; additionally, touching borders is forbidden (share boundary => invalid).
+- All points must be used at the end.
+- Score:
+  1) reward = sum_{i=0..(n-1)} i^2  (depends only on number of houses n)
+  2) penalty = sum( |area_i - avg_area| / 10 )
+  score = reward - penalty
+Goal: maximize score (i.e., maximize n first, then minimize penalty under same n)
+
+This is NP-hard-ish, so we implement a practical heuristic:
+- Generate many candidate rectangles from local neighborhoods (x/y sorted neighbors).
+- Greedy pick candidates with minimal extra = (points_in_rect - 4), then small area.
+- Cleanup remaining points by sampling 4 points and taking their bounding rectangle if feasible.
+- Multi-start over random seeds; pick best by (n, -penalty, score).
+
+Notes:
+- We use 2D Fenwick to query "how many unused points are in a rectangle" fast.
+- We use BucketGrid to enumerate actual point ids inside a rectangle for deletions.
+
+You can plug your own input points into solve(points).
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Set, Iterable, Optional
+import random
+import math
+
+W = H = 1024
+
+# -----------------------------
+# 2D Fenwick (BIT): counts of UNUSED points
+# -----------------------------
+class Fenwick2D:
+    def __init__(self, n: int, m: int):
+        self.n = n
+        self.m = m
+        self.bit = [[0] * (m + 1) for _ in range(n + 1)]
+
+    def add(self, x: int, y: int, delta: int) -> None:
+        i = x + 1
+        while i <= self.n:
+            j = y + 1
+            row = self.bit[i]
+            while j <= self.m:
+                row[j] += delta
+                j += j & -j
+            i += i & -i
+
+    def sum_prefix(self, x: int, y: int) -> int:
+        if x < 0 or y < 0:
+            return 0
+        res = 0
+        i = x + 1
+        while i > 0:
+            j = y + 1
+            row = self.bit[i]
+            while j > 0:
+                res += row[j]
+                j -= j & -j
+            i -= i & -i
+        return res
+
+    def sum_rect(self, x1: int, y1: int, x2: int, y2: int) -> int:
+        return (self.sum_prefix(x2, y2)
+                - self.sum_prefix(x1 - 1, y2)
+                - self.sum_prefix(x2, y1 - 1)
+                + self.sum_prefix(x1 - 1, y1 - 1))
+
+# -----------------------------
+# Bucket grid: enumerate points in a rectangle (fast-ish)
+# -----------------------------
+class BucketGrid:
+    def __init__(self, cell: int, W: int = 1024, H: int = 1024):
+        self.cell = cell
+        self.gx = (W + cell - 1) // cell
+        self.gy = (H + cell - 1) // cell
+        self.buckets: List[List[List[int]]] = [[[] for _ in range(self.gy)] for __ in range(self.gx)]
+
+    def add_point(self, x: int, y: int, pid: int) -> None:
+        self.buckets[x // self.cell][y // self.cell].append(pid)
+
+    def iter_points_in_rect(self, x1: int, y1: int, x2: int, y2: int,
+                            xs: List[int], ys: List[int], used: List[bool]) -> Iterable[int]:
+        c = self.cell
+        bx1, by1 = x1 // c, y1 // c
+        bx2, by2 = x2 // c, y2 // c
+        for bx in range(bx1, bx2 + 1):
+            for by in range(by1, by2 + 1):
+                for pid in self.buckets[bx][by]:
+                    if used[pid]:
+                        continue
+                    x = xs[pid]
+                    y = ys[pid]
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        yield pid
+
+# -----------------------------
+# Rect + overlap/touch forbidden
+# -----------------------------
+@dataclass(frozen=True)
+class Rect:
+    x1: int; y1: int; x2: int; y2: int  # inclusive
+
+    def area(self) -> int:
+        return (self.x2 - self.x1 + 1) * (self.y2 - self.y1 + 1)
+
+def overlap_or_touch(a: Rect, b: Rect) -> bool:
+    # touch forbidden => if not strictly separated, it's conflict
+    if a.x2 < b.x1 or b.x2 < a.x1 or a.y2 < b.y1 or b.y2 < a.y1:
+        return False
+    return True
+
+# -----------------------------
+# House record
+# -----------------------------
+@dataclass
+class House:
+    rect: Rect
+    consumed: List[int]  # all point ids consumed by this house
+
+# -----------------------------
+# Neighbor building
+# -----------------------------
+def build_neighbors(order: List[int], k: int) -> List[List[int]]:
+    n = len(order)
+    pos = [0] * n
+    for i, pid in enumerate(order):
+        pos[pid] = i
+    neigh = [[] for _ in range(n)]
+    for pid in range(n):
+        i = pos[pid]
+        lo = max(0, i - k)
+        hi = min(n - 1, i + k)
+        neigh[pid] = order[lo:hi + 1]
+    return neigh
+
+# -----------------------------
+# Candidate generation:
+# local extremes from x-neighbors and y-neighbors.
+# -----------------------------
+def generate_candidates(xs: List[int], ys: List[int],
+                        k: int,
+                        per_side: int,
+                        max_area: Optional[int],
+                        rng: random.Random) -> List[Rect]:
+    """
+    k: neighborhood size in sorted list.
+    per_side: how many left/right/bottom/top candidates to take from neighborhood.
+    """
+    n = len(xs)
+    order_x = sorted(range(n), key=lambda i: xs[i])
+    order_y = sorted(range(n), key=lambda i: ys[i])
+
+    nx = build_neighbors(order_x, k)
+    ny = build_neighbors(order_y, k)
+
+    seen: Set[Tuple[int, int, int, int]] = set()
+    cands: List[Rect] = []
+
+    # randomize pivot order for diversity
+    pivots = list(range(n))
+    rng.shuffle(pivots)
+
+    for pid in pivots:
+        x_ids = nx[pid]
+        y_ids = ny[pid]
+
+        # choose per_side from both ends
+        L = x_ids[:min(per_side, len(x_ids))]
+        R = x_ids[-min(per_side, len(x_ids)):]
+        B = y_ids[:min(per_side, len(y_ids))]
+        T = y_ids[-min(per_side, len(y_ids)):]
+
+        # small random sampling to control explosion
+        # (still yields plenty of candidates)
+        for l in L:
+            for r in R:
+                x1 = xs[l] if xs[l] < xs[r] else xs[r]
+                x2 = xs[r] if xs[l] < xs[r] else xs[l]
+                if x1 == x2:
+                    continue
+                for b in B:
+                    for t in T:
+                        y1 = ys[b] if ys[b] < ys[t] else ys[t]
+                        y2 = ys[t] if ys[b] < ys[t] else ys[b]
+                        if y1 == y2:
+                            continue
+                        key = (x1, y1, x2, y2)
+                        if key in seen:
+                            continue
+                        rect = Rect(x1, y1, x2, y2)
+                        if max_area is not None and rect.area() > max_area:
+                            continue
+                        seen.add(key)
+                        cands.append(rect)
+
+    # No fenwick info yet, so just sort by area (smaller tends to have less extra)
+    cands.sort(key=lambda r: r.area())
+    return cands
+
+# -----------------------------
+# Greedy construct:
+# prioritize low extra (=cnt-4), then small area
+# -----------------------------
+def greedy_construct(xs: List[int], ys: List[int],
+                     bit: Fenwick2D,
+                     bucket: BucketGrid,
+                     rng: random.Random,
+                     candidates: List[Rect],
+                     extra_cap: int,
+                     max_houses: Optional[int] = None) -> Tuple[List[House], List[bool]]:
+    n = len(xs)
+    used = [False] * n
+    houses: List[House] = []
+
+    def conflict(rect: Rect) -> bool:
+        for h in houses:
+            if overlap_or_touch(rect, h.rect):
+                return True
+        return False
+
+    for rect in candidates:
+        if max_houses is not None and len(houses) >= max_houses:
+            break
+        if conflict(rect):
+            continue
+
+        cnt = bit.sum_rect(rect.x1, rect.y1, rect.x2, rect.y2)
+        if cnt < 4:
+            continue
+        extra = cnt - 4
+        if extra > extra_cap:
+            continue
+
+        pts = list(bucket.iter_points_in_rect(rect.x1, rect.y1, rect.x2, rect.y2, xs, ys, used))
+        if len(pts) != cnt:
+            # if inconsistent, skip
+            continue
+
+        # accept
+        for pid in pts:
+            used[pid] = True
+            bit.add(xs[pid], ys[pid], -1)
+        houses.append(House(rect=rect, consumed=pts))
+
+    return houses, used
+
+# -----------------------------
+# Cleanup: try to cover remaining points by bounding-rect of 4 sampled points.
+# This is the "must finish" stage; may fail without local repair.
+# -----------------------------
+def cleanup_remaining(xs: List[int], ys: List[int],
+                      bit: Fenwick2D,
+                      bucket: BucketGrid,
+                      rng: random.Random,
+                      houses: List[House],
+                      used: List[bool],
+                      tries_per_house: int,
+                      allow_extra_cap: int) -> bool:
+    n = len(xs)
+
+    def conflict(rect: Rect) -> bool:
+        for h in houses:
+            if overlap_or_touch(rect, h.rect):
+                return True
+        return False
+
+    def get_unused_ids() -> List[int]:
+        return [i for i in range(n) if not used[i]]
+
+    unused = get_unused_ids()
+    while unused:
+        if len(unused) < 4:
+            return False
+        # if not multiple of 4, still can be solvable by rectangles consuming >4,
+        # but at least we must be able to continue.
+        ok = False
+        for _ in range(tries_per_house):
+            pick = rng.sample(unused, 4)
+            x1 = min(xs[i] for i in pick); x2 = max(xs[i] for i in pick)
+            y1 = min(ys[i] for i in pick); y2 = max(ys[i] for i in pick)
+            if x1 == x2 or y1 == y2:
+                continue
+            rect = Rect(x1, y1, x2, y2)
+            if conflict(rect):
+                continue
+
+            cnt = bit.sum_rect(rect.x1, rect.y1, rect.x2, rect.y2)
+            if cnt < 4 or (cnt - 4) > allow_extra_cap:
+                continue
+
+            pts = list(bucket.iter_points_in_rect(rect.x1, rect.y1, rect.x2, rect.y2, xs, ys, used))
+            if len(pts) != cnt:
+                continue
+
+            # accept
+            for pid in pts:
+                used[pid] = True
+                bit.add(xs[pid], ys[pid], -1)
+            houses.append(House(rect=rect, consumed=pts))
+            ok = True
+            break
+
+        if not ok:
+            return False
+        unused = get_unused_ids()
+
+    return True
+
+# -----------------------------
+# Score
+# -----------------------------
+def compute_score(houses: List[House]) -> Tuple[int, float, float, float]:
+    """
+    returns: (n, reward, penalty, score)
+    """
+    n = len(houses)
+    if n <= 0:
+        return 0, 0.0, 0.0, 0.0
+    reward = (n - 1) * n * (2 * n - 1) / 6.0
+    areas = [h.rect.area() for h in houses]
+    avg = sum(areas) / n
+    penalty = sum(abs(a - avg) / 10.0 for a in areas)
+    return n, reward, penalty, reward - penalty
+
+# -----------------------------
+# Solve one run (one seed)
+# -----------------------------
+def solve_one(points: List[Tuple[int, int]],
+              seed: int,
+              bucket_cell: int = 32,
+              neigh_k: int = 18,
+              per_side: int = 8,
+              extra_cap: int = 2,
+              max_area: Optional[int] = 50000,
+              cleanup_tries: int = 4000,
+              cleanup_extra_cap: int = 40) -> Tuple[List[House], Tuple[int, float, float, float], bool]:
+    rng = random.Random(seed)
+
+    n = len(points)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+
+    bit = Fenwick2D(W, H)
+    bucket = BucketGrid(bucket_cell, W=W, H=H)
+
+    for pid in range(n):
+        bit.add(xs[pid], ys[pid], +1)
+        bucket.add_point(xs[pid], ys[pid], pid)
+
+    candidates = generate_candidates(xs, ys, k=neigh_k, per_side=per_side, max_area=max_area, rng=rng)
+
+    houses, used = greedy_construct(xs, ys, bit, bucket, rng, candidates, extra_cap=extra_cap)
+
+    ok = cleanup_remaining(xs, ys, bit, bucket, rng, houses, used,
+                           tries_per_house=cleanup_tries,
+                           allow_extra_cap=cleanup_extra_cap)
+
+    score = compute_score(houses) if ok else (len(houses), 0.0, float("inf"), -float("inf"))
+    return houses, score, ok
+
+# -----------------------------
+# Multi-start wrapper
+# -----------------------------
+def solve(points: List[Tuple[int, int]],
+          starts: int = 30,
+          bucket_cell: int = 32,
+          neigh_k: int = 18,
+          per_side: int = 8,
+          extra_cap: int = 2,
+          max_area: Optional[int] = 50000,
+          cleanup_tries: int = 4000,
+          cleanup_extra_cap: int = 40) -> List[House]:
+    best_houses: List[House] = []
+    best_key = (-1, float("inf"), -float("inf"))  # (n, penalty, score) -> n max, penalty min, score max
+
+    for s in range(starts):
+        seed = 1337 + s
+        houses, (n, reward, penalty, sc), ok = solve_one(
+            points, seed=seed,
+            bucket_cell=bucket_cell,
+            neigh_k=neigh_k,
+            per_side=per_side,
+            extra_cap=extra_cap,
+            max_area=max_area,
+            cleanup_tries=cleanup_tries,
+            cleanup_extra_cap=cleanup_extra_cap
+        )
+        if not ok:
+            continue
+        key = (n, penalty, -sc)  # maximize n, minimize penalty, maximize score
+        # Compare: larger n better; for same n smaller penalty better; for same penalty larger score better.
+        # Using (n, penalty, -score) lexicographic.
+        if (best_key[0] < key[0] or
+            (best_key[0] == key[0] and best_key[1] > key[1]) or
+            (best_key[0] == key[0] and abs(best_key[1] - key[1]) < 1e-9 and best_key[2] > key[2])):
+            best_key = key
+            best_houses = houses
+
+    return best_houses
+
+# -----------------------------
+# Validation helpers
+# -----------------------------
+def validate(points: List[Tuple[int,int]], houses: List[House]) -> Tuple[bool, str]:
+    n = len(points)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+
+    used = [False] * n
+
+    # check overlap/touch
+    rects = [h.rect for h in houses]
+    for i in range(len(rects)):
+        for j in range(i+1, len(rects)):
+            if overlap_or_touch(rects[i], rects[j]):
+                return False, f"Rect conflict between house {i} and {j}"
+
+    # check that houses consume exactly all points covered by their rect, and no point double-used
+    for hi, h in enumerate(houses):
+        r = h.rect
+        # compute points in rect
+        inside = []
+        for pid in range(n):
+            if r.x1 <= xs[pid] <= r.x2 and r.y1 <= ys[pid] <= r.y2:
+                inside.append(pid)
+        inside_set = set(inside)
+        cons_set = set(h.consumed)
+        if inside_set != cons_set:
+            return False, f"House {hi} consumed set mismatch (inside={len(inside_set)}, consumed={len(cons_set)})"
+        for pid in inside:
+            if used[pid]:
+                return False, f"Point {pid} double-used"
+            used[pid] = True
+
+    if not all(used):
+        remain = sum(1 for v in used if not v)
+        return False, f"Not all points used. remaining={remain}"
+    return True, "OK"
+
+# -----------------------------
+# Example usage
+# -----------------------------
+def gen_random_points(n: int, seed: int = 0) -> List[Tuple[int,int]]:
+    rng = random.Random(seed)
+    s = set()
+    while len(s) < n:
+        s.add((rng.randrange(W), rng.randrange(H)))
+    return list(s)
+
+if __name__ == "__main__":
+    pts = gen_random_points(1200, seed=1)
+
+    houses = solve(
+        pts,
+        starts=20,          # increase for better solutions
+        bucket_cell=32,
+        neigh_k=18,
+        per_side=8,
+        extra_cap=2,        # smaller => more houses usually, but cleanup may fail
+        max_area=50000,
+        cleanup_tries=6000,
+        cleanup_extra_cap=60
+    )
+
+    ok, msg = validate(pts, houses)
+    n, reward, penalty, sc = compute_score(houses) if ok else (len(houses), 0.0, float("inf"), -float("inf"))
+    print("validate:", ok, msg)
+    print("houses:", n, "reward:", reward, "penalty:", penalty, "score:", sc)
+
+    # If you need just rectangles:
+    # rects = [(h.rect.x1, h.rect.y1, h.rect.x2, h.rect.y2) for h in houses]
