@@ -1,0 +1,211 @@
+"""
+2D Fenwick Tree (BIT) 로
+- "현재 unused 점"에 대한 직사각형 내부 개수 sum_rect(x1,y1,x2,y2) 를 빠르게 구하고
+- House를 채택하면 내부 점들을 add(x,y,-1)로 삭제(used 처리)하는 예시 코드
+
+핵심:
+- Fenwick은 '개수 카운트'만 빠르게 해줌 (직사각형 안에 몇 개인지)
+- 직사각형 안에 '어떤 점들이 있는지 열거'는 Fenwick이 못함 → 별도 구조가 필요
+  여기서는 1024가 작으니 "버킷 그리드"로 rect 내부 점 id를 빠르게 열거함
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Iterable
+import random
+
+W = H = 1024
+
+# -------------------------
+# 2D Fenwick Tree
+# -------------------------
+class Fenwick2D:
+    """
+    내부는 1-indexed.
+    A[x][y] (0-index) 값을 관리.
+    - add(x,y,delta): A[x][y] += delta
+    - sum_rect(x1,y1,x2,y2): sum_{x1..x2, y1..y2} A[x][y]
+    """
+    def __init__(self, n: int, m: int):
+        self.n = n
+        self.m = m
+        self.bit = [[0]*(m+1) for _ in range(n+1)]
+
+    def add(self, x: int, y: int, delta: int) -> None:
+        i = x + 1
+        while i <= self.n:
+            j = y + 1
+            row = self.bit[i]
+            while j <= self.m:
+                row[j] += delta
+                j += j & -j
+            i += i & -i
+
+    def sum_prefix(self, x: int, y: int) -> int:
+        # sum over [0..x] x [0..y]
+        if x < 0 or y < 0:
+            return 0
+        res = 0
+        i = x + 1
+        while i > 0:
+            j = y + 1
+            row = self.bit[i]
+            while j > 0:
+                res += row[j]
+                j -= j & -j
+            i -= i & -i
+        return res
+
+    def sum_rect(self, x1: int, y1: int, x2: int, y2: int) -> int:
+        # inclusive rect
+        return (self.sum_prefix(x2, y2)
+                - self.sum_prefix(x1-1, y2)
+                - self.sum_prefix(x2, y1-1)
+                + self.sum_prefix(x1-1, y1-1))
+
+# -------------------------
+# Bucket grid: rect 내부 점 열거용
+# -------------------------
+class BucketGrid:
+    """
+    1024x1024는 작지만, rect 내부 점을 매번 O(N)으로 훑으면 느려질 수 있어서
+    cell 크기(예: 32)로 버킷을 만들어 rect가 걸치는 버킷만 스캔.
+    """
+    def __init__(self, cell: int, W: int = 1024, H: int = 1024):
+        self.cell = cell
+        self.gx = (W + cell - 1)//cell
+        self.gy = (H + cell - 1)//cell
+        self.b = [[[] for _ in range(self.gy)] for __ in range(self.gx)]
+
+    def add_point(self, x: int, y: int, pid: int) -> None:
+        self.b[x//self.cell][y//self.cell].append(pid)
+
+    def iter_points_in_rect(
+        self,
+        x1: int, y1: int, x2: int, y2: int,
+        xs: List[int], ys: List[int], used: List[bool]
+    ) -> Iterable[int]:
+        c = self.cell
+        bx1, by1 = x1//c, y1//c
+        bx2, by2 = x2//c, y2//c
+        for bx in range(bx1, bx2+1):
+            for by in range(by1, by2+1):
+                for pid in self.b[bx][by]:
+                    if used[pid]:
+                        continue
+                    x, y = xs[pid], ys[pid]
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        yield pid
+
+# -------------------------
+# Rect + 충돌(겹침/접촉 금지) 판정
+# -------------------------
+@dataclass(frozen=True)
+class Rect:
+    x1: int; y1: int; x2: int; y2: int  # inclusive
+
+    def area(self) -> int:
+        return (self.x2-self.x1+1) * (self.y2-self.y1+1)
+
+def overlap_or_touch(a: Rect, b: Rect) -> bool:
+    # 경계 닿는 것도 금지 => 분리는 "엄격"해야 함
+    # 완전 분리 조건이 하나라도 성립하면 충돌 아님
+    if a.x2 < b.x1 or b.x2 < a.x1 or a.y2 < b.y1 or b.y2 < a.y1:
+        return False
+    return True
+
+# -------------------------
+# Fenwick 기반 "후보 평가 -> 채택 -> 삭제" 데모
+# -------------------------
+def build_structures(points: List[Tuple[int,int]], cell: int = 32):
+    n = len(points)
+    xs = [x for x,_ in points]
+    ys = [y for _,y in points]
+    used = [False]*n
+
+    bit = Fenwick2D(W, H)
+    bg  = BucketGrid(cell, W=W, H=H)
+
+    # 초기: 점 위치에 1을 넣는다
+    for pid in range(n):
+        bit.add(xs[pid], ys[pid], +1)
+        bg.add_point(xs[pid], ys[pid], pid)
+
+    return xs, ys, used, bit, bg
+
+def try_pick_house(rect: Rect,
+                   houses: List[Rect],
+                   xs: List[int], ys: List[int],
+                   used: List[bool],
+                   bit: Fenwick2D,
+                   bg: BucketGrid,
+                   extra_cap: int = 2) -> bool:
+    """
+    rect가 House 후보라고 할 때,
+    1) 기존 house들과 겹치/닿으면 reject
+    2) rect 안 unused 점 개수 cnt = bit.sum_rect(...)
+    3) cnt < 4 reject
+    4) extra = cnt-4 가 extra_cap 초과면 reject
+    5) rect 내부 unused 점들을 실제로 열거(bg)해서 전부 used 처리 + bit.add(-1)
+    """
+    # 1) 충돌 체크
+    if any(overlap_or_touch(rect, h) for h in houses):
+        return False
+
+    # 2) 직사각형 내부 점 개수(빠름): O(log^2)
+    cnt = bit.sum_rect(rect.x1, rect.y1, rect.x2, rect.y2)
+    if cnt < 4:
+        return False
+    if cnt - 4 > extra_cap:
+        return False
+
+    # 3) 실제 점 목록 열거(느릴 수 있어도 rect 범위 버킷만): avg 빠름
+    pts = list(bg.iter_points_in_rect(rect.x1, rect.y1, rect.x2, rect.y2, xs, ys, used))
+    if len(pts) != cnt:
+        # 이론상 같아야 함(used/bit/bg 일관성 깨졌을 때만 다름)
+        return False
+
+    # 4) 채택: 내부 점 전부 사용처리(삭제)
+    for pid in pts:
+        used[pid] = True
+        bit.add(xs[pid], ys[pid], -1)
+
+    houses.append(rect)
+    return True
+
+# -------------------------
+# 간단 실행 예시
+# -------------------------
+def gen_random_points(n: int, seed: int = 0) -> List[Tuple[int,int]]:
+    random.seed(seed)
+    s = set()
+    while len(s) < n:
+        s.add((random.randrange(W), random.randrange(H)))
+    return list(s)
+
+if __name__ == "__main__":
+    # 점 생성
+    points = gen_random_points(1200, seed=1)
+    xs, ys, used, bit, bg = build_structures(points, cell=32)
+
+    houses: List[Rect] = []
+
+    # 예시: 무작위로 rect 후보를 만들어 fenwick으로 cnt를 빠르게 체크하며 채택 시도
+    # (실전에서는 rect 후보를 "근처 이웃 기반"으로 생성하는게 훨씬 낫다)
+    for _ in range(20000):
+        x1 = random.randrange(W)
+        x2 = random.randrange(W)
+        y1 = random.randrange(H)
+        y2 = random.randrange(H)
+        if x1 == x2 or y1 == y2:
+            continue
+        if x1 > x2: x1, x2 = x2, x1
+        if y1 > y2: y1, y2 = y2, y1
+        rect = Rect(x1, y1, x2, y2)
+
+        try_pick_house(rect, houses, xs, ys, used, bit, bg, extra_cap=1)
+
+    # 남은 점 개수 = 전체 prefix로도 확인 가능
+    remaining = bit.sum_rect(0, 0, W-1, H-1)
+    print("houses:", len(houses))
+    print("remaining unused points:", remaining)
