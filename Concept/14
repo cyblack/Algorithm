@@ -1,0 +1,305 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import random
+
+W = H = 1024
+
+@dataclass(frozen=True)
+class Rect:
+    x1: int; y1: int; x2: int; y2: int  # inclusive
+    def area(self) -> int:
+        return (self.x2 - self.x1 + 1) * (self.y2 - self.y1 + 1)
+
+def overlap_or_touch(a: Rect, b: Rect) -> bool:
+    # touch forbidden => if not strictly separated, conflict
+    if a.x2 < b.x1 or b.x2 < a.x1 or a.y2 < b.y1 or b.y2 < a.y1:
+        return False
+    return True
+
+@dataclass
+class Region:
+    x1: int; y1: int; x2: int; y2: int
+    ids: List[int]
+
+def score_rects(rects: List[Rect]) -> float:
+    n = len(rects)
+    reward = (n - 1) * n * (2 * n - 1) / 6 if n > 0 else 0.0
+    areas = [r.area() for r in rects]
+    if not areas:
+        return 0.0
+    avg = sum(areas) / n
+    penalty = sum(abs(a - avg) / 10.0 for a in areas)
+    return reward - penalty
+
+def find_cut(ids: List[int], coord: List[int], lo: int, hi: int) -> Optional[int]:
+    """
+    ids: point ids inside region
+    coord: xs or ys
+    Find cut value c such that:
+      left: coord <= c-1
+      gap:  coord == c  (empty allowed)
+      right:coord >= c+1
+    and both sides have count multiple of 4 and >=4.
+    We return c (the gap line).
+    """
+    # sort ids by coord
+    arr = sorted(ids, key=lambda i: coord[i])
+    n = len(arr)
+    if n < 8:
+        return None
+
+    # prefix counts at each unique coordinate
+    # try cut at some existing coordinate value "c"
+    # left side uses <= c-1 (so points with coord <= c-1)
+    # right uses >= c+1 (so points with coord >= c+1)
+    # meaning points with coord==c are excluded (gap)
+    # We want left_count %4==0 and right_count %4==0.
+    unique_vals = sorted(set(coord[i] for i in ids))
+    if len(unique_vals) < 3:
+        return None
+
+    # map value -> count of points with that coord
+    cnt = {}
+    for i in ids:
+        cnt[coord[i]] = cnt.get(coord[i], 0) + 1
+
+    # prefix of counts over unique values
+    pref = []
+    s = 0
+    for v in unique_vals:
+        s += cnt[v]
+        pref.append((v, s))
+
+    total = len(ids)
+
+    # try cuts not on boundary
+    best = None
+    for idx in range(1, len(unique_vals) - 1):
+        c = unique_vals[idx]
+        left = sum_cnt_le(pref, c - 1)
+        mid  = cnt.get(c, 0)
+        right = total - left - mid
+
+        if left >= 4 and right >= 4 and left % 4 == 0 and right % 4 == 0:
+            # also ensure gap is inside (not outside region)
+            if lo < c < hi:
+                best = c
+                break
+    return best
+
+def sum_cnt_le(pref: List[Tuple[int,int]], x: int) -> int:
+    # pref = [(v, prefix_count_up_to_v)], v sorted ascending
+    # returns count of points with value <= x
+    # small sizes -> linear ok
+    ans = 0
+    for v, s in pref:
+        if v <= x:
+            ans = s
+        else:
+            break
+    return ans
+
+def split_region(region: Region, xs: List[int], ys: List[int], rng: random.Random) -> List[Region]:
+    """
+    Try to split by x or y with a gap line to prevent touching across regions.
+    """
+    ids = region.ids
+    n = len(ids)
+    if n <= 80:  # stop splitting threshold
+        return [region]
+    if n % 4 != 0:
+        # still solvable with "big cleanup rectangles", but splits using %4 are cleaner.
+        # we still attempt split; if cannot, stop.
+        pass
+
+    # try x-cut first then y-cut (randomize)
+    axes = ['x', 'y']
+    rng.shuffle(axes)
+
+    for ax in axes:
+        if ax == 'x':
+            c = find_cut(ids, xs, region.x1, region.x2)
+            if c is None:
+                continue
+            left_ids = [i for i in ids if xs[i] <= c - 1]
+            right_ids = [i for i in ids if xs[i] >= c + 1]
+            if not left_ids or not right_ids:
+                continue
+            # build two child regions (with gap)
+            r1 = Region(region.x1, region.y1, c - 1, region.y2, left_ids)
+            r2 = Region(c + 1, region.y1, region.x2, region.y2, right_ids)
+            return split_region(r1, xs, ys, rng) + split_region(r2, xs, ys, rng)
+        else:
+            c = find_cut(ids, ys, region.y1, region.y2)
+            if c is None:
+                continue
+            bot_ids = [i for i in ids if ys[i] <= c - 1]
+            top_ids = [i for i in ids if ys[i] >= c + 1]
+            if not bot_ids or not top_ids:
+                continue
+            r1 = Region(region.x1, region.y1, region.x2, c - 1, bot_ids)
+            r2 = Region(region.x1, c + 1, region.x2, region.y2, top_ids)
+            return split_region(r1, xs, ys, rng) + split_region(r2, xs, ys, rng)
+
+    # no split found
+    return [region]
+
+def solve_region(region: Region, xs: List[int], ys: List[int], rng: random.Random) -> List[Rect]:
+    """
+    Fast-and-finish local solver:
+    - Try to create many "small" 4-point rectangles (heuristic).
+    - If stuck, create one big rectangle covering all remaining points in the region (cleanup).
+    Guaranteed to finish & cover region ids (as long as region has >=4 points).
+    """
+    ids = region.ids[:]
+    rects: List[Rect] = []
+
+    # For local, we don't need inter-region conflict checks (regions are disjoint with gaps).
+    # Only ensure local rects don't overlap/touch each other (rare if we remove points disjointly, but still possible).
+    used_ids = set()
+
+    def local_conflict(r: Rect) -> bool:
+        for rr in rects:
+            if overlap_or_touch(r, rr):
+                return True
+        return False
+
+    # build a quick list of ids sorted by x then y to form tight groups
+    ids.sort(key=lambda i: (xs[i], ys[i]))
+
+    # we will repeatedly take a pivot and try to form a small 4-point bbox from its nearest neighbors
+    while True:
+        remaining = [i for i in ids if i not in used_ids]
+        m = len(remaining)
+        if m == 0:
+            break
+        if m < 4:
+            # should not happen if total was solvable; force-stop
+            break
+
+        found = False
+
+        # try a limited number of attempts to find a small rectangle that doesn't conflict
+        # (keep it cheap)
+        attempts = min(200, m)
+        for _ in range(attempts):
+            pivot = rng.choice(remaining)
+
+            # pick 3 neighbors close in x/y (cheap: sample candidates from remaining)
+            # sample K points and take closest by manhattan
+            K = min(24, m)
+            sample = rng.sample(remaining, K) if m > K else remaining[:]
+            sample.sort(key=lambda j: abs(xs[j]-xs[pivot]) + abs(ys[j]-ys[pivot]))
+            group = sample[:4]
+            if len(group) < 4:
+                continue
+
+            x1 = min(xs[i] for i in group); x2 = max(xs[i] for i in group)
+            y1 = min(ys[i] for i in group); y2 = max(ys[i] for i in group)
+            if x1 == x2 or y1 == y2:
+                continue
+            r = Rect(x1, y1, x2, y2)
+
+            # ensure r is inside region bounds
+            if not (region.x1 <= r.x1 and r.x2 <= region.x2 and region.y1 <= r.y1 and r.y2 <= region.y2):
+                continue
+
+            # count points inside r among remaining (local scan: m<=~80 typical)
+            inside = [i for i in remaining if r.x1 <= xs[i] <= r.x2 and r.y1 <= ys[i] <= r.y2]
+            if len(inside) != 4:
+                continue
+
+            if local_conflict(r):
+                continue
+
+            # accept
+            rects.append(r)
+            for i in inside:
+                used_ids.add(i)
+            found = True
+            break
+
+        if found:
+            continue
+
+        # stuck: cleanup big rectangle covering all remaining points
+        x1 = min(xs[i] for i in remaining); x2 = max(xs[i] for i in remaining)
+        y1 = min(ys[i] for i in remaining); y2 = max(ys[i] for i in remaining)
+        # need at least 4 points; ok
+        if x1 == x2:
+            # expand by 1 within region if possible
+            if x2 < region.x2: x2 += 1
+            elif x1 > region.x1: x1 -= 1
+        if y1 == y2:
+            if y2 < region.y2: y2 += 1
+            elif y1 > region.y1: y1 -= 1
+        r = Rect(x1, y1, x2, y2)
+        # should not conflict with existing local rects if we consumed disjoint points,
+        # but check anyway; if conflict, we just merge everything by resetting rects.
+        if local_conflict(r):
+            rects = [r]
+        else:
+            rects.append(r)
+        # consume all remaining
+        for i in remaining:
+            used_ids.add(i)
+        break
+
+    return rects
+
+def solve(points: List[Tuple[int,int]], seeds: int = 10) -> List[Rect]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    n = len(points)
+
+    best_rects: List[Rect] = []
+    best_key = (-1, -1e100)  # (num_houses, score)
+
+    for s in range(seeds):
+        rng = random.Random(1234 + s)
+        root = Region(0, 0, W-1, H-1, list(range(n)))
+
+        regions = split_region(root, xs, ys, rng)
+
+        rects: List[Rect] = []
+        for reg in regions:
+            if len(reg.ids) == 0:
+                continue
+            if len(reg.ids) < 4:
+                # cannot create a house; skip (shouldn't happen with good splits)
+                continue
+            rects.extend(solve_region(reg, xs, ys, rng))
+
+        # final safety: check global conflicts (should be none due to gaps)
+        ok = True
+        for i in range(len(rects)):
+            for j in range(i+1, len(rects)):
+                if overlap_or_touch(rects[i], rects[j]):
+                    ok = False
+                    break
+            if not ok:
+                break
+        if not ok:
+            continue
+
+        sc = score_rects(rects)
+        key = (len(rects), sc)
+        if key[0] > best_key[0] or (key[0] == best_key[0] and key[1] > best_key[1]):
+            best_key = key
+            best_rects = rects
+
+    return best_rects
+
+# ------------------ demo ------------------
+def gen_random_points(n: int, seed: int = 0) -> List[Tuple[int,int]]:
+    rng = random.Random(seed)
+    s = set()
+    while len(s) < n:
+        s.add((rng.randrange(W), rng.randrange(H)))
+    return list(s)
+
+if __name__ == "__main__":
+    pts = gen_random_points(1200, seed=1)
+    rects = solve(pts, seeds=15)
+    print("houses:", len(rects), "score:", score_rects(rects))
