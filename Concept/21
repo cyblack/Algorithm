@@ -1,0 +1,272 @@
+// knapsack_compare_dp_beam_greedy.cpp
+// Compile: g++ -O2 -std=c++17 knapsack_compare_dp_beam_greedy.cpp -o run
+// Run:     ./run [N] [W] [B] [seed]
+// Example: ./run 2000 100000 5000 42
+
+#include <bits/stdc++.h>
+using namespace std;
+
+struct Item {
+    int w; // cost/weight
+    int v; // value
+};
+
+struct State {
+    int w;
+    int v;
+};
+
+// Exact 0/1 knapsack DP: O(N*W), returns optimal value
+static int knapsack_dp_exact(const vector<Item>& items, int W) {
+    const int NEG = -1e9;
+    vector<int> dp(W + 1, NEG);
+    dp[0] = 0;
+
+    for (const auto& it : items) {
+        for (int w = W; w >= it.w; --w) {
+            if (dp[w - it.w] != NEG) {
+                dp[w] = max(dp[w], dp[w - it.w] + it.v);
+            }
+        }
+    }
+    return *max_element(dp.begin(), dp.end());
+}
+
+// Beam search for 0/1 knapsack (NO dominance pruning, just top-B by value)
+static int knapsack_beam_only(const vector<Item>& items, int W, int B) {
+    vector<State> beam;
+    beam.reserve(B * 2);
+    beam.push_back({0, 0});
+    int best = 0;
+
+    auto cmp = [](const State& a, const State& b) {
+        if (a.v != b.v) return a.v > b.v;  // higher value first
+        return a.w < b.w;                  // tie: smaller weight first
+    };
+
+    for (const auto& it : items) {
+        vector<State> next;
+        next.reserve(beam.size() * 2);
+
+        for (const auto& s : beam) {
+            // skip
+            next.push_back(s);
+
+            // take
+            int nw = s.w + it.w;
+            if (nw <= W) {
+                int nv = s.v + it.v;
+                next.push_back({nw, nv});
+                best = max(best, nv);
+            }
+        }
+
+        if ((int)next.size() > B) {
+            nth_element(next.begin(), next.begin() + B, next.end(), cmp);
+            next.resize(B);
+        }
+        sort(next.begin(), next.end(), cmp);
+        beam.swap(next);
+    }
+
+    return best;
+}
+
+// Heuristic #2: Greedy by value/weight ratio + 1-1 swap local improvement
+// Returns best found value (pure heuristic; no dominance, no DP).
+static int knapsack_greedy_swap(const vector<Item>& items, int W) {
+    int N = (int)items.size();
+    vector<int> idx(N);
+    iota(idx.begin(), idx.end(), 0);
+
+    // Greedy: sort by v/w desc (use cross-multiplication to avoid floating errors)
+    sort(idx.begin(), idx.end(), [&](int a, int b) {
+        long long lhs = 1LL * items[a].v * items[b].w;
+        long long rhs = 1LL * items[b].v * items[a].w;
+        if (lhs != rhs) return lhs > rhs;
+        // tie-break: higher value, then smaller weight
+        if (items[a].v != items[b].v) return items[a].v > items[b].v;
+        return items[a].w < items[b].w;
+    });
+
+    vector<char> chosen(N, 0);
+    vector<int> chosen_list;
+    chosen_list.reserve(N);
+
+    int curW = 0, curV = 0;
+
+    // Initial greedy fill
+    for (int id : idx) {
+        if (curW + items[id].w <= W) {
+            curW += items[id].w;
+            curV += items[id].v;
+            chosen[id] = 1;
+            chosen_list.push_back(id);
+        }
+    }
+
+    // Build non-chosen list (for swap candidates)
+    vector<int> nonchosen_list;
+    nonchosen_list.reserve(N);
+    for (int i = 0; i < N; i++) if (!chosen[i]) nonchosen_list.push_back(i);
+
+    // 1-1 swap local search:
+    // Try swapping in one non-chosen item by swapping out one chosen item
+    // if it improves total value and stays within weight.
+    // Repeat until no improvement.
+    bool improved = true;
+    while (improved) {
+        improved = false;
+
+        int bestDeltaV = 0;
+        int bestIn = -1, bestOut = -1;
+
+        // Brute force O(N^2) but N=2000 => ~4e6 checks, ok
+        for (int inId : nonchosen_list) {
+            const int inW = items[inId].w;
+            const int inV = items[inId].v;
+
+            // If even adding without removing fits, we can do that directly (but that's already greedy)
+            // Still, after swaps, capacity might open. So check add-only too.
+            if (curW + inW <= W) {
+                int deltaV = inV; // no removal
+                if (deltaV > bestDeltaV) {
+                    bestDeltaV = deltaV;
+                    bestIn = inId;
+                    bestOut = -1;
+                }
+            }
+
+            // Swap with one chosen item
+            for (int outId : chosen_list) {
+                const int outW = items[outId].w;
+                const int outV = items[outId].v;
+
+                int newW = curW - outW + inW;
+                if (newW <= W) {
+                    int deltaV = inV - outV;
+                    if (deltaV > bestDeltaV) {
+                        bestDeltaV = deltaV;
+                        bestIn = inId;
+                        bestOut = outId;
+                    }
+                }
+            }
+        }
+
+        if (bestDeltaV > 0 && bestIn != -1) {
+            // Apply best move
+            if (bestOut != -1) {
+                // swap out bestOut
+                chosen[bestOut] = 0;
+                curW -= items[bestOut].w;
+                curV -= items[bestOut].v;
+
+                // remove from chosen_list (swap-erase)
+                for (int i = 0; i < (int)chosen_list.size(); i++) {
+                    if (chosen_list[i] == bestOut) {
+                        chosen_list[i] = chosen_list.back();
+                        chosen_list.pop_back();
+                        break;
+                    }
+                }
+
+                // add bestOut to nonchosen_list (push)
+                nonchosen_list.push_back(bestOut);
+            }
+
+            // add bestIn
+            chosen[bestIn] = 1;
+            curW += items[bestIn].w;
+            curV += items[bestIn].v;
+            chosen_list.push_back(bestIn);
+
+            // remove bestIn from nonchosen_list (swap-erase)
+            for (int i = 0; i < (int)nonchosen_list.size(); i++) {
+                if (nonchosen_list[i] == bestIn) {
+                    nonchosen_list[i] = nonchosen_list.back();
+                    nonchosen_list.pop_back();
+                    break;
+                }
+            }
+
+            improved = true;
+        }
+    }
+
+    return curV;
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // Defaults (safe-ish)
+    int N = 2000;
+    int W = 20000;
+    int B = 5000;
+    uint32_t seed = 42;
+
+    if (argc >= 2) N = atoi(argv[1]);
+    if (argc >= 3) W = atoi(argv[2]);
+    if (argc >= 4) B = atoi(argv[3]);
+    if (argc >= 5) seed = (uint32_t)stoul(argv[4]);
+
+    mt19937 rng(seed);
+
+    // Random ranges (tweakable)
+    int w_max = min(1000, max(1, W));
+    uniform_int_distribution<int> wdist(1, w_max);
+    uniform_int_distribution<int> vdist(1, 2000);
+
+    vector<Item> items;
+    items.reserve(N);
+    for (int i = 0; i < N; i++) {
+        items.push_back({wdist(rng), vdist(rng)});
+    }
+
+    cout << "==== Random 0/1 Knapsack ====\n";
+    cout << "N=" << N << ", W=" << W << ", BeamWidth(B)=" << B << ", seed=" << seed << "\n";
+    cout << "weight_range=[1.." << w_max << "], value_range=[1..2000]\n\n";
+
+    // Beam
+    auto t0 = chrono::high_resolution_clock::now();
+    int best_beam = knapsack_beam_only(items, W, B);
+    auto t1 = chrono::high_resolution_clock::now();
+    auto beam_ms = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count();
+
+    // Greedy+Swap
+    auto t2 = chrono::high_resolution_clock::now();
+    int best_gs = knapsack_greedy_swap(items, W);
+    auto t3 = chrono::high_resolution_clock::now();
+    auto gs_ms = chrono::duration_cast<chrono::milliseconds>(t3 - t2).count();
+
+    // Exact DP
+    auto t4 = chrono::high_resolution_clock::now();
+    int best_dp = knapsack_dp_exact(items, W);
+    auto t5 = chrono::high_resolution_clock::now();
+    auto dp_ms = chrono::duration_cast<chrono::milliseconds>(t5 - t4).count();
+
+    cout << "==== Results ====\n";
+    cout << "Beam-only value       : " << best_beam << "  (time " << beam_ms << " ms)\n";
+    cout << "Greedy+1-1Swap value  : " << best_gs   << "  (time " << gs_ms   << " ms)\n";
+    cout << "DP(Optimal) value     : " << best_dp   << "  (time " << dp_ms   << " ms)\n";
+
+    auto print_ratio = [&](const string& name, int val) {
+        if (best_dp <= 0) return;
+        double ratio = (double)val / (double)best_dp;
+        double gap = (1.0 - ratio) * 100.0;
+        cout << fixed << setprecision(4);
+        cout << name << " / DP ratio  : " << ratio << " , gap " << gap << " %\n";
+    };
+
+    cout << "\n==== Quality vs Optimal (DP) ====\n";
+    print_ratio("Beam-only", best_beam);
+    print_ratio("Greedy+Swap", best_gs);
+
+    cout << "\nNote:\n";
+    cout << "- If DP is too slow, reduce W or N.\n";
+    cout << "- Greedy+Swap is still heuristic; sometimes it can get stuck in local optimum.\n";
+
+    return 0;
+}
