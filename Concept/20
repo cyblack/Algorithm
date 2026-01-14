@@ -1,0 +1,147 @@
+// knapsack_dp_vs_beam.cpp
+// Compile: g++ -O2 -std=c++17 knapsack_dp_vs_beam.cpp -o run
+// Run:     ./run [N] [W] [B] [seed]
+// Example: ./run 2000 100000 5000 42
+
+#include <bits/stdc++.h>
+using namespace std;
+
+struct Item {
+    int w; // cost/weight
+    int v; // value
+};
+
+struct State {
+    int w;
+    int v;
+};
+
+// Exact 0/1 knapsack DP: O(N*W), returns optimal value
+static int knapsack_dp_exact(const vector<Item>& items, int W) {
+    // dp[x] = max value with total weight exactly x (or at most x if we take max over x)
+    // Use -INF for unreachable
+    const int NEG = -1e9;
+    vector<int> dp(W + 1, NEG);
+    dp[0] = 0;
+
+    for (const auto& it : items) {
+        // reverse to ensure 0/1
+        for (int w = W; w >= it.w; --w) {
+            if (dp[w - it.w] != NEG) {
+                dp[w] = max(dp[w], dp[w - it.w] + it.v);
+            }
+        }
+    }
+    return *max_element(dp.begin(), dp.end());
+}
+
+// Beam search for 0/1 knapsack (NO dominance pruning, just top-B by value)
+// Returns best found value
+static int knapsack_beam_only(const vector<Item>& items, int W, int B) {
+    vector<State> beam;
+    beam.reserve(B * 2);
+    beam.push_back({0, 0});
+    int best = 0;
+
+    auto cmp = [](const State& a, const State& b) {
+        if (a.v != b.v) return a.v > b.v;  // higher value first
+        return a.w < b.w;                  // tie: smaller weight first
+    };
+
+    for (const auto& it : items) {
+        vector<State> next;
+        next.reserve(beam.size() * 2);
+
+        for (const auto& s : beam) {
+            // skip
+            next.push_back(s);
+
+            // take
+            int nw = s.w + it.w;
+            if (nw <= W) {
+                int nv = s.v + it.v;
+                next.push_back({nw, nv});
+                if (nv > best) best = nv;
+            }
+        }
+
+        // keep top B states by (value desc, weight asc)
+        if ((int)next.size() > B) {
+            nth_element(next.begin(), next.begin() + B, next.end(), cmp);
+            next.resize(B);
+        }
+        // optional: sort for stability/debug
+        sort(next.begin(), next.end(), cmp);
+
+        beam.swap(next);
+    }
+    return best;
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // Defaults (safe-ish)
+    int N = 2000;
+    int W = 20000;
+    int B = 5000;
+    uint32_t seed = 42;
+
+    if (argc >= 2) N = atoi(argv[1]);
+    if (argc >= 3) W = atoi(argv[2]);
+    if (argc >= 4) B = atoi(argv[3]);
+    if (argc >= 5) seed = (uint32_t)stoul(argv[4]);
+
+    // Random generator
+    mt19937 rng(seed);
+
+    // You can tweak these ranges.
+    // Weight range: 1..min(1000, W)  (too large weights makes problem trivial)
+    // Value range:  1..2000
+    int w_max = min(1000, max(1, W));
+    uniform_int_distribution<int> wdist(1, w_max);
+    uniform_int_distribution<int> vdist(1, 2000);
+
+    vector<Item> items;
+    items.reserve(N);
+    for (int i = 0; i < N; i++) {
+        Item it;
+        it.w = wdist(rng);
+        it.v = vdist(rng);
+        items.push_back(it);
+    }
+
+    cout << "==== Random 0/1 Knapsack ====\n";
+    cout << "N=" << N << ", W=" << W << ", BeamWidth(B)=" << B << ", seed=" << seed << "\n";
+    cout << "weight_range=[1.." << w_max << "], value_range=[1..2000]\n\n";
+
+    // Beam first (fast)
+    auto t0 = chrono::high_resolution_clock::now();
+    int best_beam = knapsack_beam_only(items, W, B);
+    auto t1 = chrono::high_resolution_clock::now();
+
+    // Exact DP (might be slow for big W)
+    auto t2 = chrono::high_resolution_clock::now();
+    int best_dp = knapsack_dp_exact(items, W);
+    auto t3 = chrono::high_resolution_clock::now();
+
+    auto beam_ms = chrono::duration_cast<chrono::milliseconds>(t1 - t0).count();
+    auto dp_ms   = chrono::duration_cast<chrono::milliseconds>(t3 - t2).count();
+
+    cout << "==== Results ====\n";
+    cout << "Beam best value : " << best_beam << "  (time " << beam_ms << " ms)\n";
+    cout << "DP   best value : " << best_dp   << "  (time " << dp_ms   << " ms)\n";
+
+    if (best_dp > 0) {
+        double ratio = (double)best_beam / (double)best_dp;
+        double gap = (1.0 - ratio) * 100.0;
+        cout << fixed << setprecision(4);
+        cout << "Beam/DP ratio   : " << ratio << "\n";
+        cout << "Optimality gap  : " << gap << " % (0% is optimal)\n";
+    }
+
+    // simple note
+    cout << "\nNote: If DP is too slow, reduce W or N, or keep W=100000 but lower N.\n";
+    return 0;
+}
